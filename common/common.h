@@ -1132,6 +1132,15 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
 }
 
+inline ggml_backend_buffer_type_t common_host_buffer_type() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) { auto * b = ggml_backend_dev_host_buffer_type(ggml_backend_dev_get(i)); if (b) return b; }
+    return ggml_backend_cpu_buffer_type();
+}
+inline llama_model_tensor_buft_override llm_ffn_exps_host_override() { return { LLM_FFN_EXPS_REGEX, common_host_buffer_type() }; }
+inline void llm_add_n_host_moe_overrides(int n, std::vector<llama_model_tensor_buft_override> & out) {
+    static std::list<std::string> strings; for (int i=0;i<n;++i) { strings.push_back(llm_ffn_exps_block_regex(i)); out.push_back({strings.back().c_str(), common_host_buffer_type()}); }
+}
+
 //
 // training utils
 //

@@ -2771,6 +2771,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg({"-hmoe", "--host-moe"}, "keep all MoE weights in pinned host memory", [](common_params & p) { p.tensor_buft_overrides.push_back(llm_ffn_exps_host_override()); }).set_env("LLAMA_ARG_HOST_MOE"));
+    add_opt(common_arg({"-nhmoe", "--n-host-moe"}, "N", "keep first N layers of MoE weights in pinned host memory", [](common_params & p, int n) { if (n < 0) throw std::invalid_argument("invalid value"); llm_add_n_host_moe_overrides(n, p.tensor_buft_overrides); }).set_env("LLAMA_ARG_N_HOST_MOE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
