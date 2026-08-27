@@ -342,7 +342,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
 
         if (inject) {
-            *inject = build_lora_mm(w_inject, xn);
+            // fold the combine-gate activation onto the inject mat-vec so the
+            // backend can fuse mat-vec + scale + sigmoid + scale into one dispatch
+            ggml_tensor * w = build_lora_mm(w_inject, xn);
+            w = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_scale(ctx0, w, 1.0f / (float) hc)), 2.0f);
+            *inject = w;
         }
 
         return mean_hc(gated);
@@ -350,9 +354,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // hyper-connection write gate (mirror of build_hc_combine)
     auto hc_combine = [&](ggml_tensor * residual, ggml_tensor * block_out, ggml_tensor * inject) {
-        ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-        w = ggml_scale(ctx0, w, 2.0f);
-        w = ggml_reshape_3d(ctx0, w, 1, hc, n_tokens);
+        // inject already carries the 2*sigmoid(x/hc) activation (see hc_mix)
+        ggml_tensor * w = ggml_reshape_3d(ctx0, inject, 1, hc, n_tokens);
 
         ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, n_tokens);
         b = ggml_repeat_4d(ctx0, b, n_embd, hc, n_tokens, 1);
@@ -542,7 +545,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
+        // fold the combine-gate activation onto the inject mat-vec so the
+        // backend can fuse mat-vec + scale + sigmoid + scale into one dispatch
+        ggml_tensor * w = build_lora_mm(w_inject, xn);
+        w = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_scale(ctx0, w, 1.0f / (float) hc)), 2.0f);
+        *inject = w;
         cb(*inject, "hc_inject", il);
     }
 
@@ -557,10 +564,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
-    // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-    w = ggml_scale(ctx0, w, 2.0f);
-    w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+    // 2*sigmoid (applied in build_hc_mix, fused with the inject mat-vec) centres the
+    // scatter weights on 1, so a zero injection is a plain residual add
+    ggml_tensor * w = ggml_reshape_3d(ctx0, inject, 1, hc, nt);
 
     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
     b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
