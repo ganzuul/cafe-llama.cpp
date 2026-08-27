@@ -101,6 +101,24 @@ public:
     // the n-gram rows for the first tokens decoded after every speculative rollback)
     uint32_t ple_hist_keep_n = 0;
 
+    // [TAG_QSA_POOLED_CACHE]
+    // Cache of the indexer's block summary keys (mean-pooled, normalized, roped), one f32
+    // row per position block, written by the graph via set_rows. Only COMPLETE blocks are
+    // ever scored (incomplete tails ride the bias), and a complete block's members never
+    // change, so rows are write-once per content epoch. Validity is a per-sequence block
+    // watermark: rows < watermark hold the current content's summaries. Rollback safety is
+    // by construction: seq_rm clamps the watermark and replay recomputes the range.
+    // Rows at or beyond the watermark may hold stale-but-finite garbage; their scores are
+    // masked by the -inf bias exactly like today's partial-block pools.
+
+    // pooled key tensor for layer il, or nullptr (no indexer / multi-stream / disabled)
+    ggml_tensor * get_pooled_k(int32_t il) const;
+
+    uint32_t get_pooled_rows() const { return pooled_rows; }   // rows per stream, incl. trailing dustbin row
+
+    // blocks of seq_id whose pooled rows are known valid; mutable via a const context like ple_hist
+    int64_t & pooled_valid(llama_seq_id seq_id) const;
+
 private:
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
@@ -120,6 +138,19 @@ private:
 
     void ple_hist_state_write(llama_io_write_i & io, llama_seq_id seq_id) const;
     void ple_hist_state_read (llama_io_read_i  & io, llama_seq_id seq_id);
+
+    // [TAG_QSA_POOLED_CACHE] storage + watermarks; empty unless the model has an indexer
+    ggml_context_ptr        pooled_ctx;
+    ggml_backend_buffer_ptr pooled_buf;
+    std::map<int32_t, ggml_tensor *> pooled_k;
+
+    uint32_t pooled_rows = 0;
+
+    mutable std::unordered_map<llama_seq_id, int64_t> pooled_w;
+
+    // clamp helpers, one per llama_memory_i operation that can invalidate rows
+    void pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+    void pooled_reset(llama_seq_id seq_id);   // -1 resets every sequence
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -175,8 +206,26 @@ public:
     //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
     //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+    // [TAG_QSA_POOLED_CACHE] the dirty_* tensors are optional: when given, the fill also
+    // resolves which blocks must be (re)pooled this ubatch — the range from the sequence's
+    // watermark to its last complete block — and advances the watermark.
+    //   dirty_cells I32 [ratio*n_dirty_max, ns] cells of each block to (re)pool, 0-padded
+    //   dirty_pos   I32 [4*n_dirty_max*ns]      mrope position rows of those blocks
+    //   dirty_rows  I64 [n_dirty_max*ns]        pooled-cache rows to write, dustbin-padded
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio) const;
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * dirty_cells = nullptr, ggml_tensor * dirty_pos = nullptr,
+                       ggml_tensor * dirty_rows = nullptr) const;
+
+    // [TAG_QSA_POOLED_CACHE] pooled tensor for il, or nullptr when the cache is unavailable
+    // (no indexer, multi-stream memory, or a non-batch context)
+    ggml_tensor * get_pooled_k(int32_t il) const;
+
+    uint32_t get_pooled_rows() const;
+
+    // capacity the dirty tables need for this ubatch: completed blocks plus pending refill
+    // below the watermark; stable at 1 during steady decode so graph reuse holds
+    uint32_t qsa_pooled_n_dirty_max(const llama_ubatch & ubatch, uint32_t ratio) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
