@@ -2344,6 +2344,10 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so both convolutions share one gather per layer
         std::map<int, ggml_tensor *> rs_rows;
 
+        // the QSA block tables and bias depend only on the cells and the ubatch, not the
+        // layer, so every QSA layer shares one input (and one host-side fill per batch)
+        void * qsa_shared = nullptr;
+
         // conv history at an explicit offset: delta-net and PLE share the row
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
