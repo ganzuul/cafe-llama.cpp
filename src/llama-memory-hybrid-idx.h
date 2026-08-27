@@ -95,6 +95,12 @@ public:
     // const because set_input updates it through a const memory context
     ple_history & ple_hist_get(llama_seq_id seq_id) const;
 
+    // how many history tokens to keep per sequence: (ple_ngram_size - 1) for the hash
+    // window, plus n_rs_seq so a ring rollback can truncate without losing the true
+    // predecessors (a shorter history EOS-pads the window after a rewind, which corrupts
+    // the n-gram rows for the first tokens decoded after every speculative rollback)
+    uint32_t ple_hist_keep_n = 0;
+
 private:
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
@@ -160,6 +166,8 @@ public:
 
     // [TAG_PLE_HISTORY] the per-sequence n-gram history of the owning memory, for set_input
     llama_memory_hybrid_idx::ple_history & get_ple_hist(llama_seq_id seq_id) const;
+
+    uint32_t get_ple_hist_keep() const;
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:

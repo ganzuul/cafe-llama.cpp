@@ -56,7 +56,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // keep enough PLE history that a rollback of up to n_rs_seq tokens still leaves the
+    // full (ple_ngram_size - 1) hash window of true predecessors; see ple_hist_keep
+    const uint32_t n_win = model.hparams.ple_ngram_size > 0 ? model.hparams.ple_ngram_size - 1 : 0;
+
+    ple_hist_keep_n = n_win + n_rs_seq;
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: this repeats llama_memory_hybrid::init_batch because the indexer cache needs the
@@ -437,9 +443,11 @@ void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_se
         io.read(&next_pos, sizeof(next_pos));
         io.read(&n_toks,   sizeof(n_toks));
 
-        // the window is never longer than ple_ngram_size - 1; anything else is a corrupt or
-        // mismatched blob, and reading it would size an allocation from the file
-        if (n_toks > LLAMA_MAX_PLE_NGRAM - 1) {
+        // the history holds the hash window plus up to ple_hist_keep_n rollback slack;
+        // anything far beyond that is a corrupt or mismatched blob, and reading it would
+        // size an allocation from the file. allow generous slack for blobs written with a
+        // larger ring than the reader's.
+        if (n_toks > (uint32_t) LLAMA_MAX_PLE_NGRAM - 1 + std::max<uint32_t>(ple_hist_keep_n, 64)) {
             throw std::runtime_error("qwen4exp PLE history: implausible token count in state blob");
         }
 
@@ -571,6 +579,12 @@ llama_memory_hybrid_idx::ple_history & llama_memory_hybrid_idx_context::get_ple_
     GGML_ASSERT(mem != nullptr);
 
     return mem->ple_hist_get(seq_id);
+}
+
+uint32_t llama_memory_hybrid_idx_context::get_ple_hist_keep() const {
+    GGML_ASSERT(mem != nullptr);
+
+    return mem->ple_hist_keep_n;
 }
 
 void llama_memory_hybrid_idx_context::set_input_qsa(
