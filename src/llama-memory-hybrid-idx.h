@@ -144,7 +144,8 @@ private:
     ggml_backend_buffer_ptr pooled_buf;
     std::map<int32_t, ggml_tensor *> pooled_k;
 
-    uint32_t pooled_rows = 0;
+    uint32_t pooled_rows  = 0;
+    uint32_t pooled_ratio = 0;
 
     mutable std::unordered_map<llama_seq_id, int64_t> pooled_w;
 

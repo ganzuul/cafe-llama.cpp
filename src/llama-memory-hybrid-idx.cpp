@@ -80,7 +80,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         if (ratio > 0 && idx_dim > 0) {
             // + 1 so a partial trailing block has a slot, + 1 dustbin row for padded writes
-            pooled_rows = kv_size/ratio + 2;
+            pooled_rows  = kv_size/ratio + 2;
+            pooled_ratio = ratio;
 
             ggml_init_params ip = {
                 /*.mem_size   =*/ 2*model.hparams.n_layer()*ggml_tensor_overhead(),
@@ -141,13 +142,7 @@ void llama_memory_hybrid_idx::pooled_rm(llama_seq_id seq_id, llama_pos p0, llama
     }
     // blocks at or beyond the first removed position lose members; earlier rows keep their
     // content (removals only ever drop the tail or a middle range, never rewrite the prefix)
-    uint32_t ratio = 0;
-    for (const auto & [il, t] : pooled_k) {
-        GGML_UNUSED(t);
-        ratio = hparams_idx.dsv4_compress_ratios[il];
-        break;
-    }
-    const int64_t blk = ratio > 0 ? std::max<llama_pos>(p0, 0)/ratio : 0;
+    const int64_t blk = pooled_ratio > 0 ? std::max<llama_pos>(p0, 0)/pooled_ratio : 0;
 
     auto & w = pooled_w[seq_id];
     w = std::min(w, blk);
@@ -842,6 +837,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         }
 
         // [TAG_QSA_POOLED_CACHE] resolve which blocks the graph must (re)pool this ubatch:
+        // note: the watermark advances here, before the compute runs. A failed-and-retried
+        // compute would skip the range on the retry; that class of failure already corrupts
+        // the recurrent states (written during compute), so the whole architecture assumes
+        // set_input -> successful compute, and this bookkeeping shares that assumption.
         // the range from the sequence's watermark to its last complete block. Complete
         // blocks are immutable, so rows below the watermark stay valid; rollbacks arrive
         // as seq_rm/state_read, which clamp the watermark before this runs.

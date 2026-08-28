@@ -13847,7 +13847,9 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0 };
 
     // k beyond the shared-memory shaders: single-dispatch radix selection, one
-    // workgroup per row, indices in no particular order (the ggml_top_k contract)
+    // workgroup per row, indices in no particular order (the ggml_top_k contract).
+    // The shader indexes with 32-bit arithmetic; supports_op enforces the same bound.
+    GGML_ASSERT((uint64_t) nrows * ncols <= UINT32_MAX && (uint64_t) nrows * k <= UINT32_MAX);
     if (k > (1u << (num_topk_pipelines - 1)) ||
         ctx->device->pipeline_topk_f32[(uint32_t)log2f(float(k)) + 1] == nullptr) {
         vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
@@ -17180,6 +17182,10 @@ static bool ggml_vk_can_fuse_mul_bcast_add(ggml_backend_vk_context * ctx, const 
     if (!ggml_can_repeat(a, add) || !ggml_can_repeat(w, add)) {
         return false;
     }
+    // the shader indexes with 32-bit arithmetic
+    if (ggml_nelements(add) > (int64_t) UINT32_MAX) {
+        return false;
+    }
     // anything interleaved in the span must be an empty view op
     for (int i = node_idx + 1; i < add_idx; ++i) {
         if (i == mul_idx) {
@@ -18808,8 +18814,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 uint32_t min_pipeline = (uint32_t)log2f(float(op->ne[0])) + 1;
                 if (min_pipeline >= num_topk_pipelines ||
                     !device->pipeline_topk_f32[min_pipeline]) {
-                    // k beyond the shared-memory shaders runs the radix selection path
-                    return true;
+                    // k beyond the shared-memory shaders runs the radix selection path,
+                    // which indexes with 32-bit arithmetic
+                    return (uint64_t) ggml_nrows(op->src[0]) * op->src[0]->ne[0] <= UINT32_MAX &&
+                           (uint64_t) ggml_nrows(op->src[0]) * op->ne[0]    <= UINT32_MAX;
                 }
             }
             return true;
