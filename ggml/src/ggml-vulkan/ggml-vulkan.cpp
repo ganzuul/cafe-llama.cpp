@@ -1045,6 +1045,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_argsort_f32[num_argsort_pipelines];
     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
+    vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[4];
     vk_pipeline pipeline_cumsum_f32;
@@ -5772,6 +5773,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline2(device, device->pipeline_topk_f32[i], "topk_f32_"+std::to_string(i), topk_nary_search_f32_len, topk_nary_search_f32_data, "main", 2, sizeof(vk_op_topk_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, device->subgroup_size, device->subgroup_size_log2}, 1, true, true, device->subgroup_size);
             } else if (2 * sizeof(int) * BLOCK_SIZE <= device->properties.limits.maxComputeSharedMemorySize) {
                 ggml_vk_create_pipeline2(device, device->pipeline_topk_f32[i], "topk_f32_"+std::to_string(i), topk_argsort_f32_len, topk_argsort_f32_data, "main", 2, sizeof(vk_op_topk_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, NCOLS_PADDED_LOG2}, 1, true);
+        }
+        if (i == 0) {
+            // radix selection for k beyond the shared-memory shaders (one workgroup per row)
+            const uint32_t RADIX_WG = std::min<uint32_t>(1024, 1u << device->max_workgroup_size_log2);
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_f32_len, topk_radix_f32_data, "main", 2, sizeof(vk_op_topk_push_constants), {RADIX_WG, 1, 1}, {RADIX_WG}, 1, true);
             }
         }
     }
@@ -13836,6 +13842,23 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 
     vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0 };
 
+    // k beyond the shared-memory shaders: single-dispatch radix selection, one
+    // workgroup per row, indices in no particular order (the ggml_top_k contract)
+    if (k > (1u << (num_topk_pipelines - 1)) ||
+        ctx->device->pipeline_topk_f32[(uint32_t)log2f(float(k)) + 1] == nullptr) {
+        vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
+        GGML_ASSERT(pipeline != nullptr);
+
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+        vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+        vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+
+        std::array<uint32_t, 3> elements = { nrows*pipeline->wg_denoms[0], 1, 1 };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, dst_buf }, pc, elements);
+        return;
+    }
+
     if (ctx->prealloc_x_need_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
@@ -18778,12 +18801,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0])) {
                     return false;
                 }
-                // We could potentially support larger, using argsort to sort the
-                // whole thing. Not clear if this is needed.
                 uint32_t min_pipeline = (uint32_t)log2f(float(op->ne[0])) + 1;
                 if (min_pipeline >= num_topk_pipelines ||
                     !device->pipeline_topk_f32[min_pipeline]) {
-                    return false;
+                    // k beyond the shared-memory shaders runs the radix selection path
+                    return true;
                 }
             }
             return true;

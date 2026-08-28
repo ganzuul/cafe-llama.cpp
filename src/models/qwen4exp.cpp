@@ -948,20 +948,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // again, so the visible set stays `width`
     const int64_t n_sel = std::max<int64_t>(width, qsa_gather_n_sel(n_kv, width));
 
-    // the Vulkan backend only runs GGML_OP_TOP_K on the GPU for rows up to 1024 elements;
-    // beyond that the op falls back to the CPU, which costs a growing GPU<->CPU round trip
-    // per QSA layer per decode step and is the dominant context-depth slowdown (measured:
-    // decode drops from 23.5 t/s to 17.4 t/s right as n_kv crosses 1024). full ARGSORT is
-    // supported at any size, so select through it instead: the first `n_sel` indices of a
-    // descending argsort are exactly the top-k (tie order may differ, which only permutes
-    // the selection among equal scores).
-    ggml_tensor * top_k;
-    if (n_kv > 1024) {
-        ggml_tensor * order = ggml_argsort(ctx0, expanded, GGML_SORT_ORDER_DESC);
-        top_k = ggml_cont(ctx0, ggml_view_3d(ctx0, order, n_sel, order->ne[1], order->ne[2],
-                order->nb[1], order->nb[2], 0));
-    } else {
-        top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, n_sel));
+    // ggml_top_k (radix selection on the Vulkan backend for large k) returns the top
+    // `width` indices in no particular order — every consumer treats the selection as a
+    // set. When the gather path runs, the row count must be padded to n_sel for the flash
+    // attention granularity: repeat the first index; the pad entries are re-masked to
+    // -inf in build_attn_qsa_gather, so duplicates are never visible.
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+
+    if (n_sel > width) {
+        ggml_tensor * first = ggml_view_3d(ctx0, top_k, 1, top_k->ne[1], top_k->ne[2],
+                top_k->nb[1], top_k->nb[2], 0);
+        ggml_tensor * pad = ggml_repeat_4d(ctx0, first, n_sel - width, top_k->ne[1], top_k->ne[2], 1);
+        top_k = ggml_concat(ctx0, top_k, pad, 0);
     }
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
