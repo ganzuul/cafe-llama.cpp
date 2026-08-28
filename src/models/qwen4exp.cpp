@@ -936,21 +936,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
-    cb(score, "indexer_score", il);
+    ggml_tensor * q_flat = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream);
 
-    // give every token of a block the block score; the budget is a whole number of
-    // blocks, so the top-k cut still lands on a block boundary
-    ggml_tensor * expanded = ggml_get_rows(ctx0,
-            ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
-    expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
-    expanded = ggml_add(ctx0, expanded, inp->bias);
+    ggml_tensor * expanded;
+    if (n_tps > 8) {
+        // batched prefill: with q as the LEFT operand the heads land in dim 0 (h fastest),
+        // so the head sum needs no permute+cont, and the summed score comes out directly
+        // in the [n_tps, n_blocks] layout the expansion gather wants. This removes two of
+        // the three full-size permute copies (~335MB/layer/chunk at 32k); the transpose
+        // feeding the row-wise top-k below is the only one that survives.
+        ggml_tensor * score = ggml_mul_mat(ctx0, q_flat, pooled);      // [nh*n_tps, n_blocks, ns]
+        score = ggml_relu(ctx0, score);
+        score = ggml_reshape_2d(ctx0, score, n_idx_h, n_tps*n_blocks*n_stream);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_reshape_3d(ctx0, score, n_tps, n_blocks, n_stream);
+        cb(score, "indexer_score", il);
+
+        // give every token of a block the block score; the budget is a whole number of
+        // blocks, so the top-k cut still lands on a block boundary
+        expanded = ggml_get_rows(ctx0, score, inp->cell_blk);          // [n_tps, n_kv, ns]
+        expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
+        expanded = ggml_add(ctx0, expanded, inp->bias);
+    } else {
+        // decode keeps pooled as the left operand: the swap would put the score matmul
+        // on the tiled MM path with nh=4 rows (the skinny-m pathology); at n_tps <= 8 the
+        // permutes are tiny anyway
+        ggml_tensor * score = ggml_mul_mat(ctx0, pooled, q_flat);
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+        score = ggml_relu(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+        cb(score, "indexer_score", il);
+
+        expanded = ggml_get_rows(ctx0,
+                ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
+        expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
+        expanded = ggml_add(ctx0, expanded, inp->bias);
+    }
     cb(expanded, "indexer_score_tokens", il);
 
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
