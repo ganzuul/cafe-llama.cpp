@@ -336,6 +336,15 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
+
+    struct ggml_tensor * ffn_gate_up_exps_hot  = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps_cold = nullptr;
+    struct ggml_tensor * ffn_gate_exps_hot  = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot  = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot    = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold   = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
@@ -796,6 +805,8 @@ struct llama_model_base : public llama_model {
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
+    void create_tensor_down_exps(llama_layer & layer, int bid, int64_t n_ff_,
+            int64_t n_embd_, int64_t n_expert_, int flags);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,

@@ -177,8 +177,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, tf);
         }
 
-        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, tf);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, tf);
+layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, tf);
+        create_tensor_down_exps(layer, il, n_ff_exp, n_embd, n_expert, tf);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, tf);
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, tf);
@@ -1470,18 +1470,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+            model.layers[il].ffn_up_exps_hot   ? model.layers[il].ffn_up_exps_hot   : model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps_hot ? model.layers[il].ffn_gate_exps_hot : model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps_hot ? model.layers[il].ffn_down_exps_hot : model.layers[il].ffn_down_exps,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
+            nullptr, model.layers[il].ffn_gate_up_exps_hot ? model.layers[il].ffn_gate_up_exps_hot : model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr,
+            model.layers[il].ffn_gate_up_exps_cold ? model.layers[il].ffn_gate_up_exps_cold : model.layers[il].ffn_up_exps_cold,
+            model.layers[il].ffn_gate_exps_cold,
+            model.layers[il].ffn_down_exps_cold);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference

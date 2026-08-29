@@ -1059,7 +1059,8 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+                  int32_t   mask_from = -1) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1115,7 +1116,10 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * up_exps_cold = nullptr,
+             ggml_tensor * gate_exps_cold = nullptr,
+             ggml_tensor * down_exps_cold = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1141,7 +1145,10 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * up_exps_cold = nullptr,
+             ggml_tensor * gate_exps_cold = nullptr,
+             ggml_tensor * down_exps_cold = nullptr) const;
 
     //
     // inputs

@@ -1098,9 +1098,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_BRANCH_IDS",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1215,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_branch_ids(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3300,6 +3304,38 @@ void ggml_mul_mat_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 0, prec_i32);
+}
+
+struct ggml_tensor * ggml_moe_branch_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        int32_t               lo,
+        int32_t               hi,
+        int32_t               mask_base) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(lo >= 0 && hi > lo);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+
+    int32_t params[] = { lo, hi, mask_base };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_BRANCH_IDS;
+    result->src[0] = ids;
+
+    return result;
+}
+
+void ggml_mul_mat_id_set_mask_from(
+        struct ggml_tensor * a,
+        int32_t              first) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(first < a->src[0]->ne[2]);
+    // one mask slot per expert rank
+    GGML_ASSERT(first < 0 || a->src[0]->ne[2] - first >= a->src[2]->ne[0]);
+
+    // stored with a bias so that the default of 0 means no mask slots
+    ggml_set_op_params_i32(a, 0, first < 0 ? 0 : first + 1);
 }
 
 void ggml_mul_mat_set_hint(

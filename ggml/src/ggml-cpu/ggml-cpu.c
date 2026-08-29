@@ -1547,6 +1547,7 @@ static void ggml_compute_forward_mul_mat_id(
     const enum ggml_type type = src0->type;
 
     const bool src1_cont = ggml_is_contiguous(src1);
+    const int32_t mask_from = ggml_get_op_params_i32(dst, 0) - 1;
 
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
@@ -1629,6 +1630,12 @@ static void ggml_compute_forward_mul_mat_id(
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
+
+                if (mask_from >= 0 && i02 >= mask_from) {
+                    // mask slots hold zeros, write them without reading the weights
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
@@ -1732,6 +1739,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_ADD_ID:
             {
                 ggml_compute_forward_add_id(params, tensor);
+            } break;
+        case GGML_OP_MOE_BRANCH_IDS:
+            {
+                ggml_compute_forward_moe_branch_ids(params, tensor);
             } break;
         case GGML_OP_ADD1:
             {
@@ -2232,6 +2243,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONT:
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
+        case GGML_OP_MOE_BRANCH_IDS:
         case GGML_OP_ADD1:
         case GGML_OP_ACC:
         case GGML_OP_CUMSUM:

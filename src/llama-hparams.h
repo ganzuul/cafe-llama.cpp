@@ -62,6 +62,8 @@ struct llama_hparams {
     int32_t  router_layer = -1;
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
+    // number of routed experts kept resident; 0 means the experts are not split by residency
+    uint32_t n_expert_hot = 0;
     uint32_t n_rel_attn_bkts = 0;
 
     // TODO: this needs to be reworked

@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_BRANCH_IDS,
+
         GGML_OP_COUNT,
     };
 
@@ -1447,6 +1449,24 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // marks the experts of `as` from `first` onwards as mask slots. they must hold zeros, so a
+    // backend that computes them produces zeros, and the CPU backend skips them instead.
+    // there must be one slot per expert rank: a token may not use the same expert twice.
+    // used to split one expert set across backends. first < 0 disables it, which is the default.
+    // maps router ids to the local numbering of one expert branch:
+    // an id in [lo, hi) becomes id - lo, any other id becomes mask_base + its rank.
+    // the mask slots must hold zeros, see ggml_mul_mat_id_set_mask_from.
+    GGML_API struct ggml_tensor * ggml_moe_branch_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            int32_t               lo,
+            int32_t               hi,
+            int32_t               mask_base);
+
+    GGML_API void ggml_mul_mat_id_set_mask_from(
+            struct ggml_tensor  * a,
+            int32_t               first);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

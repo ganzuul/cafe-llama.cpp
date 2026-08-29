@@ -12019,3 +12019,28 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+
+// ggml_compute_forward_moe_branch_ids
+
+void ggml_compute_forward_moe_branch_ids(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * ids = dst->src[0];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == ids->ne[0] && dst->ne[1] == ids->ne[1]);
+
+    const int32_t lo        = ggml_get_op_params_i32(dst, 0);
+    const int32_t hi        = ggml_get_op_params_i32(dst, 1);
+    const int32_t mask_base = ggml_get_op_params_i32(dst, 2);
+
+    for (int64_t i1 = params->ith; i1 < dst->ne[1]; i1 += params->nth) {
+        const int32_t * src_row = (const int32_t *) ((const char *) ids->data + i1*ids->nb[1]);
+              int32_t * dst_row =       (int32_t *) ((      char *) dst->data + i1*dst->nb[1]);
+
+        for (int64_t i0 = 0; i0 < dst->ne[0]; i0++) {
+            const int32_t id = src_row[i0*ids->nb[0]/sizeof(int32_t)];
+            dst_row[i0] = id >= lo && id < hi ? id - lo : mask_base + (int32_t) i0;
+        }
+    }
+}

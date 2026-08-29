@@ -4651,23 +4651,43 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+// mask_from < 0 is the plain case. otherwise the experts from mask_from on are zeroed mask slots,
+// and every second id points at one of them, using a distinct slot per rank.
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, int n_used = 0, int mask_from = -1) {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
             // ids
+            std::vector<int32_t> perm(mask_from < 0 ? 0 : mask_from);
+            for (size_t i = 0; i < perm.size(); i++) {
+                perm[i] = i;
+            }
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<int32_t> data(t->ne[0]);
-                for (int i = 0; i < t->ne[0]; i++) {
-                    data[i] = i % n_mats;
+                if (mask_from < 0) {
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i % n_mats;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                } else {
+                    // a token may not use the same expert twice, so the real experts come from a
+                    // permutation and every second rank takes the mask slot that belongs to it
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i < n_used && i % 2 == 1 ? mask_from + i : perm[i % mask_from];
+                    }
                 }
-                std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
             init_tensor_uniform(t);
+            if (mask_from >= 0 && t->ne[2] == n_mats) {
+                // zero the mask slots of the expert tensor; for these types zero bytes read back as zero
+                std::vector<uint8_t> zeros((n_mats - mask_from) * t->nb[2], 0);
+                ggml_backend_tensor_set(t, zeros.data(), mask_from * t->nb[2], zeros.size());
+            }
         }
     }
 }
@@ -4682,9 +4702,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const int mask_from;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, mask_from);
     }
 
     double max_nmse_err() override {
@@ -4706,10 +4727,11 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, int mask_from = -1)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), mask_from(mask_from) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(mask_from < 0 || (mask_from > 0 && n_mats - mask_from >= n_used));
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4728,13 +4750,16 @@ struct test_mul_mat_id : public test_case {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        if (mask_from >= 0) {
+            ggml_mul_mat_id_set_mask_from(out, mask_from);
+        }
         ggml_set_name(out, "out");
 
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, n_used, mask_from);
     }
 };
 
@@ -6051,6 +6076,54 @@ struct test_concat : public test_case {
 };
 
 // GGML_OP_ARGSORT
+// GGML_OP_MOE_BRANCH_IDS
+struct test_moe_branch_ids : public test_case {
+    const int64_t n_expert_used;
+    const int64_t n_tokens;
+    const int32_t n_expert;
+    const int32_t lo;
+    const int32_t hi;
+    const int32_t mask_base;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_expert_used, n_tokens, n_expert, lo, hi, mask_base);
+    }
+
+    test_moe_branch_ids(int64_t n_expert_used = 4, int64_t n_tokens = 7, int32_t n_expert = 16,
+            int32_t lo = 0, int32_t hi = 8, int32_t mask_base = 8)
+        : n_expert_used(n_expert_used), n_tokens(n_tokens), n_expert(n_expert),
+          lo(lo), hi(hi), mask_base(mask_base) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_moe_branch_ids(ctx, ids, lo, hi, mask_base);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_I32) { continue; }
+            std::vector<int32_t> pool(n_expert);
+            for (int32_t i = 0; i < n_expert; i++) {
+                pool[i] = i;
+            }
+            // a token never uses the same expert twice, so each row is a sample without replacement
+            std::vector<int32_t> data(ggml_nelements(t));
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::shuffle(pool.begin(), pool.end(), rng);
+                std::copy(pool.begin(), pool.begin() + t->ne[0], data.begin() + r*t->ne[0]);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 struct test_argsort : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9145,6 +9218,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
 
+    test_cases.emplace_back(new test_moe_branch_ids(4, 7,  16, 0, 8,  8));   // hot branch
+    test_cases.emplace_back(new test_moe_branch_ids(4, 7,  16, 8, 16, 8));   // cold branch
+    test_cases.emplace_back(new test_moe_branch_ids(10, 1, 512, 0, 165, 165));
+    test_cases.emplace_back(new test_moe_branch_ids(10, 256, 512, 165, 512, 347));
+
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -9370,6 +9449,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
+        // mask slots, see ggml_mul_mat_id_set_mask_from. limited to types whose zero bytes read back as zero
+        if (type_a == GGML_TYPE_F32 || type_a == GGML_TYPE_F16 || type_a == GGML_TYPE_BF16 ||
+            type_a == GGML_TYPE_Q4_0 || type_a == GGML_TYPE_Q8_0 || type_a == GGML_TYPE_Q4_K) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 64,  1, 3*ggml_blck_size(type_a), 4));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 64, 16, 3*ggml_blck_size(type_a), 4));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 64, 64, 3*ggml_blck_size(type_a), 4));
+        }
     }
 
     for (ggml_type type_a : base_types) {

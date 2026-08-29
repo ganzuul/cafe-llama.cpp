@@ -1219,6 +1219,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
+    ml.get_key(LLM_KV_EXPERT_HOT_COUNT,        hparams.n_expert_hot,    false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
 
@@ -3120,11 +3121,42 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+    if (hparams.n_expert_hot > 0) {
+        const int64_t n_hot  = hparams.n_expert_hot + hparams.n_expert_used;
+        const int64_t n_cold = n_expert_ - hparams.n_expert_hot + hparams.n_expert_used;
+
+        // merged gate_up halves the number of expert matmuls, which matters most on the CPU branch
+        layer.ffn_gate_up_exps_hot = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS_HOT, "weight", bid), {n_embd_, n_ff_ * 2, n_hot}, TENSOR_NOT_REQUIRED);
+        if (layer.ffn_gate_up_exps_hot) {
+            layer.ffn_gate_up_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS_COLD, "weight", bid), {n_embd_, n_ff_ * 2, n_cold}, flags);
+            return;
+        }
+
+        layer.ffn_gate_exps_hot  = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT,  "weight", bid), {n_embd_, n_ff_, n_hot},  flags);
+        layer.ffn_up_exps_hot    = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_HOT,    "weight", bid), {n_embd_, n_ff_, n_hot},  flags);
+        layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", bid), {n_embd_, n_ff_, n_cold}, flags);
+        layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", bid), {n_embd_, n_ff_, n_cold}, flags);
+        return;
+    }
+
     layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
     }
+}
+
+void llama_model_base::create_tensor_down_exps(llama_layer & layer, int bid, int64_t n_ff_, int64_t n_embd_, int64_t n_expert_, int flags) {
+    if (hparams.n_expert_hot > 0) {
+        const int64_t n_hot  = hparams.n_expert_hot + hparams.n_expert_used;
+        const int64_t n_cold = n_expert_ - hparams.n_expert_hot + hparams.n_expert_used;
+
+        layer.ffn_down_exps_hot  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_HOT,  "weight", bid), {n_ff_, n_embd_, n_hot},  flags);
+        layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", bid), {n_ff_, n_embd_, n_cold}, flags);
+        return;
+    }
+
+    layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", bid), {n_ff_, n_embd_, n_expert_}, flags);
 }
 
 void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,

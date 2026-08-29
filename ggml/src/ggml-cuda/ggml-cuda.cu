@@ -28,6 +28,7 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/moe-branch-ids.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -2098,6 +2099,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ADD_ID:
             ggml_cuda_op_add_id(ctx, dst);
+            break;
+        case GGML_OP_MOE_BRANCH_IDS:
+            ggml_cuda_op_moe_branch_ids(ctx, dst);
             break;
         case GGML_OP_SUB:
             ggml_cuda_op_sub(ctx, dst);
@@ -5179,6 +5183,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
             break;
+        case GGML_OP_MOE_BRANCH_IDS:
+            return op->src[0]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:

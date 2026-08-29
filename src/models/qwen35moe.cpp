@@ -97,7 +97,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+        create_tensor_down_exps(layer, il, n_ff_exp, n_embd, n_expert, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
 
         // Shared experts
@@ -124,7 +124,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, mtp_flags);
+        create_tensor_down_exps(layer, il, n_ff_exp, n_embd, n_expert, mtp_flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, mtp_flags);
 
         // Shared experts
@@ -501,18 +501,22 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+            model.layers[il].ffn_up_exps_hot   ? model.layers[il].ffn_up_exps_hot   : model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps_hot ? model.layers[il].ffn_gate_exps_hot : model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps_hot ? model.layers[il].ffn_down_exps_hot : model.layers[il].ffn_down_exps,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
+            nullptr, model.layers[il].ffn_gate_up_exps_hot ? model.layers[il].ffn_gate_up_exps_hot : model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr,
+            model.layers[il].ffn_gate_up_exps_cold ? model.layers[il].ffn_gate_up_exps_cold : model.layers[il].ffn_up_exps_cold,
+            model.layers[il].ffn_gate_exps_cold,
+            model.layers[il].ffn_down_exps_cold);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
@@ -679,18 +683,22 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             layer.ffn_gate_inp,
-            layer.ffn_up_exps,
-            layer.ffn_gate_exps,
-            layer.ffn_down_exps,
+            layer.ffn_up_exps_hot   ? layer.ffn_up_exps_hot   : layer.ffn_up_exps,
+            layer.ffn_gate_exps_hot ? layer.ffn_gate_exps_hot : layer.ffn_gate_exps,
+            layer.ffn_down_exps_hot ? layer.ffn_down_exps_hot : layer.ffn_down_exps,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, layer.ffn_gate_up_exps,
+            nullptr, layer.ffn_gate_up_exps_hot ? layer.ffn_gate_up_exps_hot : layer.ffn_gate_up_exps,
             layer.ffn_up_exps_s,
             layer.ffn_gate_exps_s,
-            layer.ffn_down_exps_s);
+            layer.ffn_down_exps_s,
+            nullptr,
+            layer.ffn_gate_up_exps_cold ? layer.ffn_gate_up_exps_cold : layer.ffn_up_exps_cold,
+            layer.ffn_gate_exps_cold,
+            layer.ffn_down_exps_cold);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
     if (layer.ffn_up_shexp != nullptr) {

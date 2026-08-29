@@ -4415,6 +4415,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // row groups
         const int n_ids = ids->ne[0]; // n_expert_used
         const int n_as  = ne02;       // n_expert
+        const int32_t mask_from = ggml_get_op_params_i32(op, 0) - 1;
 
         const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
         const size_t nbw2 = nbw1*ne11;
@@ -4459,6 +4460,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
 
                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                    if (mask_from >= 0 && i02 >= mask_from) {
+                        // mask slots hold zeros, write them without reading the weights
+                        memset((char *) dst->data + id * nb1 + iid1 * nb2, 0, ne0 * sizeof(float));
+                        continue;
+                    }
 
                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
                     matrix_row_counts[i02] += 1;
