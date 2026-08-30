@@ -5366,6 +5366,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // Experimental Qwen3.8 MTP path: allow only the standalone blk.48 draft MoE
+    // to offload at token batch 1 while preserving the normal threshold for target layers.
+    if (getenv("QWEN38_MTP_DRAFT_EXPERT_OFFLOAD") != nullptr &&
+        op->op == GGML_OP_MUL_MAT_ID && op->src[0] != nullptr) {
+        const char * name = op->src[0]->name;
+        if (strncmp(name, "blk.48.ffn_", 11) == 0 && strstr(name, "_exps") != nullptr) {
+            return true;
+        }
+    }
+
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
