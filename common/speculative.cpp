@@ -2339,6 +2339,18 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (spec_mtp) {
+        if (const char * env_ubatch = std::getenv("QWEN38_MTP_UBATCH")) {
+            const int value = std::atoi(env_ubatch);
+            if (value > 0) {
+                result.n_ubatch = std::min(result.n_batch, value);
+                LOG_INF("MTP draft ubatch override: %d\n", result.n_ubatch);
+            }
+        }
+    }
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
