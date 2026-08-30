@@ -1700,6 +1700,57 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        static constexpr uint32_t state_magic   = 0x5350544dU; // "MTPS"
+        static constexpr uint32_t state_version = 1;
+
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq ||
+                pending_h[seq_id].size() != (size_t) n_embd) {
+            return false;
+        }
+
+        const uint32_t n_embd_state = (uint32_t) n_embd;
+        const size_t   header_size  = 3 * sizeof(uint32_t);
+        const size_t   row_size     = (size_t) n_embd * sizeof(float);
+
+        data.resize(header_size + row_size);
+        std::memcpy(data.data() + 0 * sizeof(uint32_t), &state_magic,   sizeof(state_magic));
+        std::memcpy(data.data() + 1 * sizeof(uint32_t), &state_version, sizeof(state_version));
+        std::memcpy(data.data() + 2 * sizeof(uint32_t), &n_embd_state, sizeof(n_embd_state));
+        std::memcpy(data.data() + header_size, pending_h[seq_id].data(), row_size);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        static constexpr uint32_t state_magic   = 0x5350544dU; // "MTPS"
+        static constexpr uint32_t state_version = 1;
+
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const size_t header_size   = 3 * sizeof(uint32_t);
+        const size_t expected_size = header_size + (size_t) n_embd * sizeof(float);
+        uint32_t magic        = 0;
+        uint32_t version      = 0;
+        uint32_t n_embd_state = 0;
+
+        if (data.size() >= header_size) {
+            std::memcpy(&magic,        data.data() + 0 * sizeof(uint32_t), sizeof(magic));
+            std::memcpy(&version,      data.data() + 1 * sizeof(uint32_t), sizeof(version));
+            std::memcpy(&n_embd_state, data.data() + 2 * sizeof(uint32_t), sizeof(n_embd_state));
+        }
+
+        if (data.size() != expected_size || magic != state_magic ||
+                version != state_version || n_embd_state != (uint32_t) n_embd) {
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            return;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), data.data() + header_size,
+                (size_t) n_embd * sizeof(float));
+    }
+
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -37,6 +38,10 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static constexpr uint32_t SERVER_SLOT_DRAFT_MAGIC        = 0x54464453U; // "SDFT"
+static constexpr uint32_t SERVER_SLOT_DRAFT_VERSION      = 1;
+static constexpr size_t   SERVER_SLOT_DRAFT_HEADER_WORDS = 4;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -2456,6 +2461,45 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                    const std::string draft_filepath = filepath + ".dft";
+                    if (ctx_dft) {
+                        std::vector<uint8_t> data_spec;
+                        common_speculative_get_state(slot->spec, slot->id, data_spec);
+
+                        if (packed.size() > UINT32_MAX || data_spec.size() > UINT32_MAX) {
+                            send_error(task, "Slot draft state payload is too large", ERROR_TYPE_SERVER);
+                            break;
+                        }
+
+                        const size_t header_size = SERVER_SLOT_DRAFT_HEADER_WORDS * sizeof(uint32_t);
+                        const size_t payload_size = header_size + packed.size() + data_spec.size();
+                        if (payload_size % sizeof(llama_token) != 0) {
+                            send_error(task, "Slot draft state payload is not token-aligned", ERROR_TYPE_SERVER);
+                            break;
+                        }
+
+                        llama_tokens packed_dft(payload_size / sizeof(llama_token), 0);
+                        auto * payload = reinterpret_cast<uint8_t *>(packed_dft.data());
+                        const uint32_t prompt_size = (uint32_t) packed.size();
+                        const uint32_t spec_size   = (uint32_t) data_spec.size();
+
+                        std::memcpy(payload + 0 * sizeof(uint32_t), &SERVER_SLOT_DRAFT_MAGIC,   sizeof(uint32_t));
+                        std::memcpy(payload + 1 * sizeof(uint32_t), &SERVER_SLOT_DRAFT_VERSION, sizeof(uint32_t));
+                        std::memcpy(payload + 2 * sizeof(uint32_t), &prompt_size, sizeof(uint32_t));
+                        std::memcpy(payload + 3 * sizeof(uint32_t), &spec_size,   sizeof(uint32_t));
+                        std::memcpy(payload + header_size, packed.data(), packed.size());
+                        if (!data_spec.empty()) {
+                            std::memcpy(payload + header_size + packed.size(), data_spec.data(), data_spec.size());
+                        }
+
+                        const size_t nwrite_dft = llama_state_seq_save_file(
+                            ctx_dft, draft_filepath.c_str(), slot->id,
+                            packed_dft.data(), packed_dft.size());
+                        if (nwrite_dft == 0) {
+                            send_error(task, "Unable to save slot draft state", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
                     const size_t nwrite = llama_state_seq_save_file(
                         ctx_tgt, filepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
@@ -2496,6 +2540,7 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+                    const std::string draft_filepath = filepath + ".dft";
 
                     size_t nread = 0;
                     try {
@@ -2510,6 +2555,63 @@ private:
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
                         }
                         packed.resize(n_packed);
+
+                        if (ctx_dft) {
+                            size_t n_packed_dft = 0;
+                            llama_tokens packed_dft;
+                            size_t nread_dft = llama_state_seq_load_file(ctx_dft, draft_filepath.c_str(), slot->id, nullptr, 0, &n_packed_dft);
+                            if (nread_dft != 0) {
+                                packed_dft.resize(std::max<size_t>(1, n_packed_dft));
+                                nread_dft = llama_state_seq_load_file(ctx_dft, draft_filepath.c_str(), slot->id, packed_dft.data(), packed_dft.size(), &n_packed_dft);
+                            }
+                            if (nread_dft == 0) {
+                                throw std::runtime_error("No available draft state for slot save file");
+                            }
+                            packed_dft.resize(n_packed_dft);
+
+                            const size_t header_size = SERVER_SLOT_DRAFT_HEADER_WORDS * sizeof(uint32_t);
+                            const size_t payload_size = packed_dft.size() * sizeof(llama_token);
+                            if (payload_size < header_size) {
+                                throw std::runtime_error("Invalid slot draft state payload");
+                            }
+
+                            const auto * payload = reinterpret_cast<const uint8_t *>(packed_dft.data());
+                            uint32_t magic = 0;
+                            uint32_t version = 0;
+                            uint32_t prompt_size = 0;
+                            uint32_t spec_size = 0;
+                            std::memcpy(&magic,       payload + 0 * sizeof(uint32_t), sizeof(uint32_t));
+                            std::memcpy(&version,     payload + 1 * sizeof(uint32_t), sizeof(uint32_t));
+                            std::memcpy(&prompt_size, payload + 2 * sizeof(uint32_t), sizeof(uint32_t));
+                            std::memcpy(&spec_size,   payload + 3 * sizeof(uint32_t), sizeof(uint32_t));
+
+                            if (magic != SERVER_SLOT_DRAFT_MAGIC || version != SERVER_SLOT_DRAFT_VERSION ||
+                                    prompt_size != packed.size() ||
+                                    (size_t) prompt_size > payload_size - header_size ||
+                                    (size_t) spec_size != payload_size - header_size - (size_t) prompt_size) {
+                                throw std::runtime_error("Invalid slot draft state envelope");
+                            }
+                            if (std::memcmp(payload + header_size, packed.data(), packed.size()) != 0) {
+                                throw std::runtime_error("Target and draft slot save files have mismatched tokens");
+                            }
+
+                            std::vector<uint8_t> data_spec(spec_size);
+                            if (spec_size > 0) {
+                                std::memcpy(data_spec.data(), payload + header_size + prompt_size, spec_size);
+                                common_speculative_set_state(slot->spec, slot->id, data_spec);
+
+                                std::vector<uint8_t> data_spec_check;
+                                if (!common_speculative_get_state(slot->spec, slot->id, data_spec_check) ||
+                                        data_spec_check != data_spec) {
+                                    throw std::runtime_error("Unable to restore slot speculative state");
+                                }
+                            } else {
+                                std::vector<uint8_t> data_spec_check;
+                                if (common_speculative_get_state(slot->spec, slot->id, data_spec_check)) {
+                                    throw std::runtime_error("Slot save file is missing required speculative state");
+                                }
+                            }
+                        }
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
 
