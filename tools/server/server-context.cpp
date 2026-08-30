@@ -2571,6 +2571,7 @@ private:
 
                             const size_t header_size = SERVER_SLOT_DRAFT_HEADER_WORDS * sizeof(uint32_t);
                             const size_t payload_size = packed_dft.size() * sizeof(llama_token);
+                            const size_t prompt_bytes = packed.size() * sizeof(llama_token);
                             if (payload_size < header_size) {
                                 throw std::runtime_error("Invalid slot draft state payload");
                             }
@@ -2586,12 +2587,12 @@ private:
                             std::memcpy(&spec_size,   payload + 3 * sizeof(uint32_t), sizeof(uint32_t));
 
                             if (magic != SERVER_SLOT_DRAFT_MAGIC || version != SERVER_SLOT_DRAFT_VERSION ||
-                                    prompt_size != packed.size() ||
+                                    prompt_size != prompt_bytes ||
                                     (size_t) prompt_size > payload_size - header_size ||
                                     (size_t) spec_size != payload_size - header_size - (size_t) prompt_size) {
                                 throw std::runtime_error("Invalid slot draft state envelope");
                             }
-                            if (std::memcmp(payload + header_size, packed.data(), packed.size()) != 0) {
+                            if (std::memcmp(payload + header_size, packed.data(), prompt_bytes) != 0) {
                                 throw std::runtime_error("Target and draft slot save files have mismatched tokens");
                             }
 
