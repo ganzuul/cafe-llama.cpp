@@ -1915,7 +1915,18 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+
+    // Q3_PLE is intentionally local CPU lookup-only. Never forward a graph that
+    // contains it to RPC even if the remote backend would otherwise accept it.
+    if (op->type == GGML_TYPE_Q3_PLE) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] != nullptr && op->src[i]->type == GGML_TYPE_Q3_PLE) {
+            return false;
+        }
+    }
+
     //TODO: call the remote backend and cache the results
     return true;
 }

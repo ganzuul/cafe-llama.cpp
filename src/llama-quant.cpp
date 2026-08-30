@@ -293,13 +293,24 @@ static void llama_tensor_dequantize_impl(
 //
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
-    // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
-
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
 
     const std::string name = ggml_get_name(tensor);
+
+    // COPY normally preserves every tensor. The only exception is the explicit
+    // PLE-only Q3_PLE override used for the separately authorized derivative gate.
+    if (params->only_copy) {
+        if (name != "per_layer_token_embd.weight" || params->tt_overrides == nullptr) {
+            return false;
+        }
+        for (const auto * p = params->tt_overrides; p->pattern != nullptr; ++p) {
+            if (p->type == GGML_TYPE_Q3_PLE && std::regex_search(name, std::regex(p->pattern))) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // This used to be a regex, but <regex> has an extreme cost to compile times.
     bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
@@ -693,6 +704,31 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
         return tensor->type;
     }
+    if (params->only_copy) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                if (qtype == GGML_TYPE_Q3_PLE && tensor_name != "per_layer_token_embd.weight") {
+                    throw std::runtime_error(format("type %s is restricted to per_layer_token_embd.weight", ggml_type_name(qtype)));
+                }
+                return tensor_type_fallback(qs, tensor, qtype);
+            }
+        }
+        return tensor->type;
+    }
+
+    // Reject Q3_PLE overrides for every tensor except the isolated PLE table
+    // before category-specific fast paths can return a different type.
+    {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (qtype == GGML_TYPE_Q3_PLE && std::regex_search(tensor_name, pattern) &&
+                    tensor_name != "per_layer_token_embd.weight") {
+                throw std::runtime_error(format("type %s is restricted to per_layer_token_embd.weight", ggml_type_name(qtype)));
+            }
+        }
+    }
+
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
         // per_layer_token_embd follows --token-embedding-type by default, but it is a large
         // separate table, so let an explicit --tensor-type name it
@@ -742,6 +778,10 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
         // incompatible tensor shapes are handled here - fallback to a compatible type
         new_type = tensor_type_fallback(qs, tensor, new_type);
+    }
+
+    if (new_type == GGML_TYPE_Q3_PLE && std::strcmp(tensor->name, "per_layer_token_embd.weight") != 0) {
+        throw std::runtime_error(format("type %s is restricted to per_layer_token_embd.weight", ggml_type_name(new_type)));
     }
 
     return new_type;

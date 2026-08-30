@@ -1,6 +1,8 @@
 #include "../src/llama-ext.h"
 #include "ggml-cpp.h"
+#ifndef Q3_PLE_LOCAL_ONLY_BUILD
 #include "gguf-model-data.h"
+#endif
 #include "llama.h"
 
 #include <algorithm>
@@ -9,10 +11,12 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#ifndef Q3_PLE_LOCAL_ONLY_BUILD
 // ---------------------------------------------------------------------------
 // ftype name <-> enum mapping
 // ---------------------------------------------------------------------------
@@ -497,13 +501,123 @@ static int run_remote_tests(const std::string & snapshot_dir, const char * argv0
     return total_fail > 0 ? 1 : 0;
 }
 
+#endif // Q3_PLE_LOCAL_ONLY_BUILD
+
+static bool test_q3_ple_quant_type_selection() {
+    llama_quant_model_desc desc = {};
+    desc.architecture           = "qwen4exp";
+    desc.n_embd                 = 2560;
+    desc.n_ff                   = 640;
+    desc.n_layer                = 48;
+    desc.n_head                 = 24;
+    desc.n_head_kv              = 2;
+    desc.n_expert               = 512;
+    desc.n_embd_head_k          = 256;
+    desc.n_embd_head_v          = 256;
+
+    llama_model * model = llama_quant_model_from_metadata(&desc);
+    GGML_ASSERT(model != nullptr);
+
+    struct ggml_init_params ctx_params = {3 * ggml_tensor_overhead(), nullptr, true};
+    ggml_context * ctx = ggml_init(ctx_params);
+    ggml_tensor * tensors[] = {
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 160, 3),
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 256),
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 256),
+    };
+    ggml_set_name(tensors[0], "per_layer_token_embd.weight");
+    ggml_set_name(tensors[1], "token_embd.weight");
+    ggml_set_name(tensors[2], "blk.0.ffn_down_exps.weight");
+
+    const llama_model_tensor_override ple_override[] = {
+        {"^per_layer_token_embd\\.weight$", GGML_TYPE_Q3_PLE},
+        {nullptr, GGML_TYPE_COUNT},
+    };
+    llama_model_quantize_params qparams = llama_model_quantize_default_params();
+    qparams.ftype                = LLAMA_FTYPE_MOSTLY_Q4_0;
+    qparams.token_embedding_type = GGML_TYPE_Q8_0;
+    qparams.tt_overrides         = ple_override;
+
+    quantize_state_impl * qs = llama_quant_init(model, &qparams);
+    ggml_type result_types[3] = {};
+    llama_quant_compute_types(qs, qparams.ftype, tensors, result_types, 3);
+    llama_quant_free(qs);
+    const bool selection_ok = result_types[0] == GGML_TYPE_Q3_PLE &&
+                              result_types[1] == GGML_TYPE_Q8_0 &&
+                              result_types[2] != GGML_TYPE_Q3_PLE;
+
+    qparams.tt_overrides = nullptr;
+    qs = llama_quant_init(model, &qparams);
+    llama_quant_compute_types(qs, qparams.ftype, tensors, result_types, 3);
+    llama_quant_free(qs);
+    const bool default_ok = result_types[0] != GGML_TYPE_Q3_PLE &&
+                            result_types[1] != GGML_TYPE_Q3_PLE &&
+                            result_types[2] != GGML_TYPE_Q3_PLE;
+    qparams.tt_overrides = ple_override;
+
+    qparams.only_copy = true;
+    qs = llama_quant_init(model, &qparams);
+    llama_quant_compute_types(qs, qparams.ftype, tensors, result_types, 3);
+    llama_quant_free(qs);
+    const bool copy_override_ok = result_types[0] == GGML_TYPE_Q3_PLE &&
+                                  result_types[1] == GGML_TYPE_F32 &&
+                                  result_types[2] == GGML_TYPE_F32;
+
+    const llama_model_tensor_override bad_override[] = {
+        {"^blk\\.0\\.ffn_down_exps\\.weight$", GGML_TYPE_Q3_PLE},
+        {nullptr, GGML_TYPE_COUNT},
+    };
+    qparams.only_copy = false;
+    qparams.tt_overrides = bad_override;
+    qs = llama_quant_init(model, &qparams);
+    bool misuse_rejected = false;
+    try {
+        llama_quant_compute_types(qs, qparams.ftype, tensors, result_types, 3);
+    } catch (const std::exception &) {
+        misuse_rejected = true;
+    }
+    llama_quant_free(qs);
+
+    const llama_model_tensor_override token_bad_override[] = {
+        {"^token_embd\\.weight$", GGML_TYPE_Q3_PLE},
+        {nullptr, GGML_TYPE_COUNT},
+    };
+    qparams.tt_overrides = token_bad_override;
+    qs = llama_quant_init(model, &qparams);
+    bool token_misuse_rejected = false;
+    try {
+        llama_quant_compute_types(qs, qparams.ftype, tensors, result_types, 3);
+    } catch (const std::exception &) {
+        token_misuse_rejected = true;
+    }
+    llama_quant_free(qs);
+
+    ggml_free(ctx);
+    llama_model_free(model);
+    printf("test_q3_ple_quant_type_selection: exact_override: %s\n", selection_ok ? "OK" : "FAIL");
+    printf("test_q3_ple_quant_type_selection: default_never_selects: %s\n", default_ok ? "OK" : "FAIL");
+    printf("test_q3_ple_quant_type_selection: copy_with_override: %s\n", copy_override_ok ? "OK" : "FAIL");
+    printf("test_q3_ple_quant_type_selection: neural_misuse_rejected: %s\n", misuse_rejected ? "OK" : "FAIL");
+    printf("test_q3_ple_quant_type_selection: token_misuse_rejected: %s\n\n", token_misuse_rejected ? "OK" : "FAIL");
+    return selection_ok && default_ok && copy_override_ok && misuse_rejected && token_misuse_rejected;
+}
+
+
 int main(int argc, char ** argv) {
+#ifdef Q3_PLE_LOCAL_ONLY_BUILD
+    GGML_UNUSED(argc);
+    GGML_UNUSED(argv);
+    return test_q3_ple_quant_type_selection() ? 0 : 1;
+#else
     std::string snapshot_dir = SNAPSHOT_DIR;
     bool        generate     = false;
+    bool        q3_ple_local_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--generate") == 0) {
             generate = true;
+        } else if (strcmp(argv[i], "--q3-ple-local-only") == 0) {
+            q3_ple_local_only = true;
         } else if (strcmp(argv[i], "--snapshot-dir") == 0 && i + 1 < argc) {
             snapshot_dir = argv[++i];
         }
@@ -513,8 +627,16 @@ int main(int argc, char ** argv) {
         return run_generate(snapshot_dir);
     }
 
+    if (!test_q3_ple_quant_type_selection()) {
+        return 1;
+    }
+    if (q3_ple_local_only) {
+        return 0;
+    }
+
     // suppress llama log warnings during test (e.g. tensor type fallback messages)
     llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
 
     return run_remote_tests(snapshot_dir, argv[0]);
+#endif
 }

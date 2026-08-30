@@ -109,6 +109,89 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     }
 }
 
+static int q3_ple_round(float x) {
+    const float f = floorf(x);
+    const float r = x - f;
+    int q = (int) f;
+    if (r > 0.5f || (r == 0.5f && (q & 1))) {
+        ++q;
+    }
+    return q;
+}
+
+static void q3_ple_make_codes(const float * x, float d, uint8_t * codes) {
+    for (int j = 0; j < QK3_PLE; ++j) {
+        // Divide directly: 1/d can overflow for valid BF16 subnormal scales.
+        int q = d > 0.0f ? q3_ple_round(x[j]/d) : 0;
+        q = MAX(-4, MIN(3, q));
+        codes[j] = (uint8_t) (q + 4);
+    }
+}
+
+void quantize_row_q3_ple_ref(const float * GGML_RESTRICT x, block_q3_ple * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK3_PLE == 0);
+
+    const int64_t nb = k/QK3_PLE;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * xi = x + i*QK3_PLE;
+        float xmin = xi[0];
+        float xmax = xi[0];
+        for (int j = 0; j < QK3_PLE; ++j) {
+            GGML_ASSERT(isfinite(xi[j]));
+            xmin = MIN(xmin, xi[j]);
+            xmax = MAX(xmax, xi[j]);
+        }
+
+        float d = MAX(-xmin/4.0f, xmax/3.0f);
+        uint8_t codes[QK3_PLE];
+        q3_ple_make_codes(xi, d, codes);
+
+        for (int pass = 0; pass < 2; ++pass) {
+            float numerator = 0.0f;
+            float denominator = 0.0f;
+            for (int j = 0; j < QK3_PLE; ++j) {
+                const int q = codes[j] - 4;
+                numerator += xi[j]*q;
+                denominator += q*q;
+            }
+            if (denominator == 0.0f) {
+                break;
+            }
+            const float refined = numerator/denominator;
+            if (!(refined > 0.0f) || !isfinite(refined)) {
+                break;
+            }
+            uint8_t next[QK3_PLE];
+            q3_ple_make_codes(xi, refined, next);
+            d = refined;
+            const bool stable = memcmp(codes, next, sizeof(codes)) == 0;
+            memcpy(codes, next, sizeof(codes));
+            if (stable) {
+                break;
+            }
+        }
+
+        ggml_bf16_t stored = GGML_FP32_TO_BF16(d);
+        if (d > 0.0f && stored.bits == 0) {
+            stored.bits = 1;
+        }
+        y[i].d = stored.bits;
+        d = GGML_BF16_TO_FP32(stored);
+        q3_ple_make_codes(xi, d, codes);
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QK3_PLE; ++j) {
+            const int bit = 3*j;
+            const int byte = bit/8;
+            const int shift = bit%8;
+            const uint16_t packed = (uint16_t) codes[j] << shift;
+            y[i].qs[byte] |= packed & 0xff;
+            if (byte + 1 < (int) sizeof(y[i].qs)) {
+                y[i].qs[byte + 1] |= packed >> 8;
+            }
+        }
+    }
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
@@ -452,6 +535,27 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
             const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
             // 00=-1, 01=0, 10=+1, 11=+2
             y[i*qk + j] = ((int)q - 1) * d;
+        }
+    }
+}
+
+void dequantize_row_q3_ple(const block_q3_ple * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK3_PLE == 0);
+
+    const int64_t nb = k/QK3_PLE;
+    for (int64_t i = 0; i < nb; ++i) {
+        ggml_bf16_t stored = { x[i].d };
+        const float d = GGML_BF16_TO_FP32(stored);
+        for (int j = 0; j < QK3_PLE; ++j) {
+            const int bit = 3*j;
+            const int byte = bit/8;
+            const int shift = bit%8;
+            uint16_t packed = x[i].qs[byte];
+            if (byte + 1 < (int) sizeof(x[i].qs)) {
+                packed |= (uint16_t) x[i].qs[byte + 1] << 8;
+            }
+            const int q = ((packed >> shift) & 7) - 4;
+            y[i*QK3_PLE + j] = d*q;
         }
     }
 }
@@ -2123,6 +2227,12 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
         qrow += row_size;
     }
     return nrow * row_size;
+}
+
+size_t quantize_q3_ple(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q3_ple_ref(src, dst, nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q3_PLE, n_per_row);
 }
 
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5648,6 +5758,17 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ4_NL:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
+            } break;
+        case GGML_TYPE_Q3_PLE:
+            {
+                const block_q3_ple * q = (const block_q3_ple *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const uint16_t bits = q[i].d & 0x7fff;
+                    if (bits >= 0x7f80) {
+                        fprintf(stderr, "%s: invalid BF16 scale in block %zu\n", __func__, i);
+                        return false;
+                    }
+                }
             } break;
 
         case GGML_TYPE_I8:

@@ -346,6 +346,11 @@ if (TARGET cpp-httplib)
     endif()
 endif()
 
+if (NOT TARGET test-quant-type-selection)
+    llama_build_and_test(test-quant-type-selection.cpp LABEL "model")
+    target_compile_definitions(test-quant-type-selection PRIVATE Q3_PLE_LOCAL_ONLY_BUILD=1)
+endif()
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

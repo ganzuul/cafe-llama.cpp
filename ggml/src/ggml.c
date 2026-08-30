@@ -868,6 +868,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_iq4_nl,
         .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_nl_ref,
     },
+    [GGML_TYPE_Q3_PLE] = {
+        .type_name                = "q3_ple",
+        .blck_size                = QK3_PLE,
+        .type_size                = sizeof(block_q3_ple),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q3_ple,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q3_ple_ref,
+    },
     [GGML_TYPE_IQ4_XS] = {
         .type_name                = "iq4_xs",
         .blck_size                = QK_K,
@@ -8017,6 +8025,7 @@ size_t ggml_quantize_chunk(
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q3_PLE:  result = quantize_q3_ple (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

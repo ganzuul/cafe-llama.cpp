@@ -2300,6 +2300,25 @@ struct test_get_rows : public test_case {
     }
 };
 
+struct test_get_rows_q3_ple : public test_get_rows {
+    test_get_rows_q3_ple() : test_get_rows(GGML_TYPE_Q3_PLE, 160, 5, 4, 1, 1, false) {}
+
+    std::string vars() override {
+        return "type=q3_ple,n=160,m=5,rows=[4,1,4,0]";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32 && !ggml_is_view_op(t->op)) {
+                const int data[4] = {4, 1, 4, 0};
+                ggml_backend_tensor_set(t, data, 0, sizeof(data));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -8333,6 +8352,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_Q3_PLE,
 };
 
 static const ggml_type base_types[] = {
@@ -8475,6 +8495,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows_q3_ple());
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
