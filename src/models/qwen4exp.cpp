@@ -450,6 +450,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // the rows without output are dropped once, either in the last layer or after it: dropping them
+    // twice indexes the already cropped rows with the ids of the uncropped ones
+    const bool crop_last_layer = inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
         ple_emb = build_inp_ple(mctx_hyb);
@@ -486,7 +490,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        const bool crop_last_layer = inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
         if (il == n_layer - 1 && crop_last_layer) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
@@ -519,7 +522,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(flat_hc, "h_nextn", -1);
     res->t_h_nextn = flat_hc;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (!crop_last_layer && !cparams.embeddings_nextn_masked && inp_out_ids) {
         flat_hc = ggml_get_rows(ctx0, flat_hc, inp_out_ids);
         res_hc  = ggml_reshape_3d(ctx0, flat_hc, n_embd, hc, n_outputs);
     }
