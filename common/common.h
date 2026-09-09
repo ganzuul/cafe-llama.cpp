@@ -682,6 +682,8 @@ struct common_params {
     bool models_autoload = true;        // automatically load models when requested via the router server
     std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
 
+    std::string expert_trace_router = ""; // trace MoE router inputs + routed experts to this file (expert-prefetch study)
+
     bool log_json = false;
 
     std::string slot_save_path;

@@ -1984,6 +1984,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
+        cb(cur, "ffn_moe_router_input", il);
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
