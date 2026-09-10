@@ -1536,6 +1536,130 @@ struct ggml_cuda_expert_lru_cache {
     }
 };
 
+// Staging buffer manager for MOE expert gather MVP.
+// Manages pinned memory staging buffers for hot/cold expert routing.
+// Hot experts: copied from GPU cache to staging (fast, stays on GPU)
+// Cold experts: read from RAM to staging (slower, PCIe transfer)
+struct ggml_moe_staging_manager {
+    struct staging_entry {
+        void * pinned_ptr = nullptr;   // pinned host memory (CPU accessible)
+        void * dev_ptr = nullptr;      // device memory (GPU accessible)
+        size_t size = 0;
+        uint64_t last_used = 0;
+        int expert_id = -1;
+    };
+
+    int device = 0;
+    size_t max_bytes = 0;
+    size_t current_bytes = 0;
+    uint64_t step_counter = 0;
+    bool initialized = false;
+
+    std::vector<staging_entry> entries;  // linear scan for LRU (small N)
+
+    void init(int dev, size_t max_mb = 1024) {
+        if (initialized) {
+            return;
+        }
+        device = dev;
+        max_bytes = (size_t)max_mb * 1024 * 1024;
+        initialized = true;
+    }
+
+    // Get staging buffer for an expert. Returns pinned_ptr for CPU, dev_ptr for GPU.
+    // Sets out_is_hot=true if the expert was already cached (hot), false if cold.
+    staging_entry * get_staging(int expert_id, size_t size, cudaStream_t stream, bool & out_is_hot) {
+        if (!initialized) {
+            init(device);
+        }
+
+        out_is_hot = false;
+        ++step_counter;
+
+        // Linear scan for existing entry (small N experts)
+        for (auto & entry : entries) {
+            if (entry.expert_id == expert_id) {
+                entry.last_used = step_counter;
+                out_is_hot = true;
+                return &entry;
+            }
+        }
+
+        // Evict LRU entry if needed
+        if (current_bytes + size > max_bytes && !entries.empty()) {
+            int lru_idx = 0;
+            uint64_t lru_time = entries[0].last_used;
+            for (int i = 1; i < (int)entries.size(); ++i) {
+                if (entries[i].last_used < lru_time) {
+                    lru_time = entries[i].last_used;
+                    lru_idx = i;
+                }
+            }
+            auto & evict = entries[lru_idx];
+            if (evict.pinned_ptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaFreeHost(evict.pinned_ptr));
+            }
+            if (evict.dev_ptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaFree(evict.dev_ptr));
+            }
+            current_bytes -= evict.size;
+            entries.erase(entries.begin() + lru_idx);
+        }
+
+        // Allocate new staging entry
+        staging_entry new_entry;
+        new_entry.expert_id = expert_id;
+        new_entry.size = size;
+
+        // Allocate pinned host memory (CPU accessible)
+        ggml_cuda_set_device(device);
+        cudaError_t err = cudaMallocHost(&new_entry.pinned_ptr, size);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            clear();
+            return nullptr;
+        }
+
+        // Allocate device memory (GPU accessible)
+        err = cudaMalloc(&new_entry.dev_ptr, size);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            CUDA_CHECK(cudaFreeHost(new_entry.pinned_ptr));
+            new_entry.pinned_ptr = nullptr;
+            clear();
+            return nullptr;
+        }
+
+        new_entry.last_used = step_counter;
+        entries.push_back(new_entry);
+        current_bytes += size;
+
+        return &entries.back();
+    }
+
+    void clear() {
+        if (!entries.empty()) {
+            ggml_cuda_set_device(device);
+            for (auto & entry : entries) {
+                if (entry.pinned_ptr) {
+                    CUDA_CHECK(cudaFreeHost(entry.pinned_ptr));
+                }
+                if (entry.dev_ptr) {
+                    CUDA_CHECK(cudaFree(entry.dev_ptr));
+                }
+            }
+            entries.clear();
+            current_bytes = 0;
+        }
+    }
+
+    ~ggml_moe_staging_manager() {
+        clear();
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1604,9 +1728,13 @@ struct ggml_backend_cuda_context {
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
         expert_cache.init(device);
+        staging_mgr.init(device);
     }
 
     ggml_cuda_expert_lru_cache expert_cache;
+
+    // [MVP] Staging buffer manager for hot/cold expert routing
+    ggml_moe_staging_manager staging_mgr;
 
     ggml_cuda_stream_context concurrent_stream_context;
 

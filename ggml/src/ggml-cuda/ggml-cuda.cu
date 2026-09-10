@@ -2027,17 +2027,33 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
         src0_slice.data     = (char *) src0->data + i02*nb02;
 
+        // [MVP] Hot/cold expert routing:
+        // - Hot experts: use cached device pointer from LRU cache
+        // - Cold experts: read from CPU host and copy to staging buffer
         ggml_cuda_pool_alloc<char> src0_dev_buf(ctx.pool());
         if (src0_is_host) {
             const size_t src0_slice_bytes = ggml_nbytes(&src0_slice);
-            bool allocated = false;
-            void * cached_ptr = ctx.expert_cache.get_or_alloc(src0_slice.data, src0_slice_bytes, stream, allocated);
-            if (cached_ptr) {
-                src0_slice.data = cached_ptr;
+            bool out_is_hot = false;
+
+            // Try staging manager first (hot/cold routing)
+            auto * staging_entry = ctx.staging_mgr.get_staging(i02, src0_slice_bytes, stream, out_is_hot);
+            if (staging_entry && staging_entry->dev_ptr) {
+                // Hot expert: use cached staging device pointer
+                src0_slice.data = (char *) staging_entry->dev_ptr;
             } else {
+                // Cold expert: read from CPU host and copy to staging buffer
                 src0_dev_buf.alloc(src0_slice_bytes);
                 CUDA_CHECK(cudaMemcpyAsync(src0_dev_buf.ptr, src0_slice.data, src0_slice_bytes, cudaMemcpyHostToDevice, stream));
                 src0_slice.data = src0_dev_buf.ptr;
+
+                // Update staging manager with the new entry
+                // Note: staging_entry was already created by get_staging, we just need to copy data
+                if (staging_entry && staging_entry->pinned_ptr) {
+                    // Copy to pinned memory for future CPU access
+                    CUDA_CHECK(cudaMemcpyAsync(staging_entry->pinned_ptr, src0_slice.data, src0_slice_bytes, cudaMemcpyDeviceToHost, stream));
+                    // Copy to device memory
+                    CUDA_CHECK(cudaMemcpyAsync(staging_entry->dev_ptr, src0_slice.data, src0_slice_bytes, cudaMemcpyHostToDevice, stream));
+                }
             }
         }
         ggml_tensor src1_slice;
