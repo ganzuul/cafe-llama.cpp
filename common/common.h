@@ -1144,6 +1144,18 @@ inline void llm_add_n_host_moe_overrides(int n, std::vector<llama_model_tensor_b
     static std::list<std::string> strings; for (int i=0;i<n;++i) { strings.push_back(llm_ffn_exps_block_regex(i)); out.push_back({strings.back().c_str(), common_host_buffer_type()}); }
 }
 
+// Staging buffer override for MOE expert gather MVP.
+// Ensures expert tensors are placed on CUDA host (pinned) memory
+// so CPU can read them for gather and GPU can DMA from them.
+// Uses common_host_buffer_type() which returns CUDA_Host when available,
+// falling back to CPU buffer type when CUDA is not compiled.
+inline llama_model_tensor_buft_override llm_ffn_exps_staging_override() {
+    return { LLM_FFN_EXPS_REGEX, common_host_buffer_type() };
+}
+inline void llm_add_n_staging_moe_overrides(int n, std::vector<llama_model_tensor_buft_override> & out) {
+    static std::list<std::string> strings; for (int i=0;i<n;++i) { strings.push_back(llm_ffn_exps_block_regex(i)); out.push_back({strings.back().c_str(), common_host_buffer_type()}); }
+}
+
 //
 // training utils
 //
