@@ -1981,69 +1981,6 @@ struct llama_model_hy_v3 : public llama_model_base {
 };
 
 
-struct llama_model_hy_v4 : public llama_model_base {
-    llama_model_hy_v4(const struct llama_model_params & params) : llama_model_base(params) {}
-    void load_arch_hparams(llama_model_loader & ml) override;
-    void load_arch_tensors(llama_model_loader & ml) override;
-
-    struct graph : public llm_graph_context {
-        graph(const llama_model & model, const llm_graph_params & params);
-
-        // iHC (independent Hyper-Connections): pre reduces the hc streams to one and returns the
-        // per-stream post gates, post writes the sublayer output back into the streams, head
-        // collapses the streams before the final norm.
-        ggml_tensor * build_hc_pre(
-                ggml_tensor * x,
-                ggml_tensor * hc_fn,
-                ggml_tensor * hc_scale,
-                ggml_tensor * hc_base,
-                ggml_tensor ** post,
-                int il) const;
-
-        ggml_tensor * build_hc_post(
-                ggml_tensor * x,
-                ggml_tensor * residual,
-                ggml_tensor * post,
-                int il) const;
-
-        ggml_tensor * build_hc_head(
-                ggml_tensor * x,
-                ggml_tensor * hc_fn,
-                ggml_tensor * hc_scale,
-                ggml_tensor * hc_base) const;
-
-        ggml_tensor * build_attention(
-                const llama_model & model,
-                llm_graph_input_attn_k * inp_attn,
-                ggml_tensor * cur,
-                ggml_tensor * inp_pos,
-                float kq_scale,
-                int il) const;
-
-        // DSA lightning indexer: top-k KV positions for this layer. Only "full" layers compute
-        // it, "shared" layers reuse the last preceding full layer result through last_top_k.
-        ggml_tensor * build_indexer_top_k(
-                const llama_model & model,
-                llm_graph_input_attn_k_dsa * inp_attn_dsa,
-                ggml_tensor * cur,
-                ggml_tensor * qr,
-                ggml_tensor * inp_pos,
-                int il) const;
-
-        ggml_tensor * build_attention_dsa(
-                const llama_model & model,
-                llm_graph_input_attn_k_dsa * inp_attn_dsa,
-                ggml_tensor * cur,
-                ggml_tensor * inp_pos,
-                ggml_tensor ** last_top_k,
-                float kq_scale,
-                int il) const;
-    };
-
-    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
-};
-
-
 struct llama_model_hunyuan_vl : public llama_model_base {
     llama_model_hunyuan_vl(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -2341,20 +2278,12 @@ struct llama_model_qwen35 : public llama_model_base {
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
-    class llm_graph_input_qsa;
-
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-
-    protected:
-        // graph_mtp ctor: binds the members without building the trunk
-        struct no_build_t {};
-        graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
-            llm_build_delta_net_base(params), model(model) {}
-
+    private:
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2389,16 +2318,24 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
-        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-        // so the layers sharing a ratio share one input set
-        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
-
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // [TAG_QSA_GATHER] ported from EngramHalo.cpp: gathered decode attention
+        int64_t qsa_gather_n_sel(int64_t n_kv, int64_t width) const;
+
+        ggml_tensor * build_attn_qsa_gather(
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * kq_mask,
+                ggml_tensor * q_cur,
+                ggml_tensor * top_k,
+                int64_t       width,
+                float         kq_scale,
+                int           il);
+
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
-                    ggml_tensor * kq_mask,
                             int * sections,
                             int   il);
 
@@ -2417,25 +2354,26 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * gate,
                             int   layer);
 
-        // build_rs writes the state tensor in place, so one gather per cache tensor is reused
-        std::map<ggml_tensor *, ggml_tensor *> rs_rows;
+        // build_rs writes the state tensor in place, so both convolutions share one gather per layer
+        std::map<int, ggml_tensor *> rs_rows;
 
-        // one conv history per cache tensor: delta-net and PLE each have their own
+        // the QSA block tables and bias depend only on the cells and the ubatch, not the
+        // layer, so every QSA layer shares one input (and one host-side fill per batch)
+        void * qsa_shared = nullptr;
+
+        // conv history at an explicit offset: delta-net and PLE share the row
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-
+                        int64_t   row_offset,
                             int   il);
-
-        ggml_tensor * build_inp_ple(
-  const llama_memory_hybrid_idx_context * mctx_hyb);
 
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,
-                    ggml_tensor * emb,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * hidden,
                             int   il);
 
@@ -2447,7 +2385,9 @@ struct llama_model_qwen4exp : public llama_model_base {
         const llama_model & model;
     };
 
-    struct graph_mtp : public graph {
+    // LLM_GRAPH_TYPE_DECODER_MTP draft head: one dense-attention hyper-connection block
+    // fed by fc_embd(enorm(emb)) + fc_hidden(mean(hnorm(h_wide))), closed by its own mixer
+    struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 

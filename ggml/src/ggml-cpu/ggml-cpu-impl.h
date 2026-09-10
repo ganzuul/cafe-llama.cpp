@@ -27,6 +27,11 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    // [Gap 3] Optional callback invoked by thread 0 after task completion.
+    // Used by MOE gather to signal CUDA event recording back to the GPU side.
+    // Signature: void (*cb)(void * user_data);
+    void * cb_data;
 };
 
 

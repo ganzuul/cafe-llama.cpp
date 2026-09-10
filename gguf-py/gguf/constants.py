@@ -129,7 +129,6 @@ class Keys:
         MOE_EVERY_N_LAYERS                = "{arch}.moe_every_n_layers"
         MOE_LATENT_SIZE                   = "{arch}.moe_latent_size"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
-        NEXTN_SHARED_TARGET_TENSORS       = "{arch}.nextn_shared_target_tensors"
         NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"
         DEEPSTACK_MAPPING                 = "{arch}.deepstack_mapping"
         POOLING_TYPE                      = "{arch}.pooling_type"
@@ -163,12 +162,7 @@ class Keys:
         TARGET_LAYERS                     = "{arch}.target_layers"
         TARGET_HIDDEN_SIZE                = "{arch}.target_hidden_size"
         BLOCK_SIZE                        = "{arch}.block_size"
-        CONV_KERNEL_SIZE                  = "{arch}.conv_kernel_size"
-        CONV_GROUP_SIZE                   = "{arch}.conv_group_size"
-        SELECTOR_RANK                     = "{arch}.selector_rank"
-        SELECTOR_TOP_K                    = "{arch}.selector_top_k"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
-        HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
 
@@ -231,12 +225,10 @@ class Keys:
         COUNT                = "{arch}.hyper_connection.count"
         SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"
         EPSILON              = "{arch}.hyper_connection.epsilon"
-        # scale of the post gate (DeepSeek-V4 hardcodes 2.0)
-        MAGNITUDE            = "{arch}.hyper_connection.magnitude"
         # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
         LOW_RANK             = "{arch}.hyper_connection.low_rank"
 
-    class PerLayerEmbedding:
+    class PLE:
         LAYERS             = "{arch}.ple.layers"
         NGRAM_SIZE         = "{arch}.ple.ngram_size"
         HEADS_PER_NGRAM    = "{arch}.ple.heads_per_ngram"
@@ -595,7 +587,6 @@ class MODEL_ARCH(IntEnum):
     HUNYUAN_DENSE    = auto()
     HUNYUAN_VL       = auto()
     HY_V3            = auto()
-    HY_V4            = auto()
     SMOLLM3          = auto()
     GPT_OSS          = auto()
     LFM2             = auto()
@@ -701,7 +692,6 @@ class MODEL_TENSOR(IntEnum):
     FFN_DOWN_CHEXP       = auto()
     FFN_UP_CHEXP         = auto()
     FFN_EXP_PROBS_B      = auto()
-    FFN_EXP_PROBS_B_VL   = auto() # deepseek4 vision (bias for image tokens)
     FFN_GATE_TID2EID     = auto()
     MOE_LATENT_DOWN      = auto() # nemotron 3 super
     MOE_LATENT_UP        = auto() # nemotron 3 super
@@ -955,9 +945,6 @@ class MODEL_TENSOR(IntEnum):
     V_RESMPL_PROJ        = auto() # minicpmv
     V_RESMPL_QUERY       = auto() # minicpmv
     V_TOK_EMBD_IMG_BREAK = auto() # pixtral
-    V_TOK_EMBD_IMG_START = auto() # deepseek4v
-    V_TOK_EMBD_IMG_END   = auto() # deepseek4v
-    V_TOK_EMBD_IMG_PAD   = auto() # deepseek4v
     V_MM_PATCH_MERGER    = auto() # mistral small 3.1
     V_DS_NORM            = auto() # qwen3vl
     V_DS_FC1             = auto() # qwen3vl
@@ -1183,10 +1170,11 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HNORM            = auto()
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
-    # qwen4exp: the MTP head's own hyper-connection mixer, in place of an output norm
-    NEXTN_HC_HEAD_NORM     = auto()
-    NEXTN_HC_HEAD_DOWN     = auto()
-    NEXTN_HC_HEAD_UP       = auto()
+    NEXTN_FC_EMBD          = auto()
+    NEXTN_FC_HIDDEN        = auto()
+    NEXTN_HC_NORM          = auto()
+    NEXTN_HC_DOWN          = auto()
+    NEXTN_HC_UP            = auto()
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
@@ -1194,13 +1182,6 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
     DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
     DSPARK_CONF_PROJ       = auto()  # confidence head
-    DFLASH_ATTN_CONV_BASE  = auto()
-    DFLASH_ATTN_CONV_PROJ  = auto()
-    DFLASH_FFN_CONV_BASE   = auto()
-    DFLASH_FFN_CONV_PROJ   = auto()
-    DFLASH_SELECTOR_PREV   = auto()
-    DFLASH_SELECTOR_NEXT   = auto()
-    DFLASH_SELECTOR_HIDDEN = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1353,7 +1334,6 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.HUNYUAN_DENSE:    "hunyuan-dense",
     MODEL_ARCH.HUNYUAN_VL:       "hunyuan_vl",
     MODEL_ARCH.HY_V3:            "hy_v3",
-    MODEL_ARCH.HY_V4:            "hy_v4",
     MODEL_ARCH.SMOLLM3:          "smollm3",
     MODEL_ARCH.GPT_OSS:          "gpt-oss",
     MODEL_ARCH.LFM2:             "lfm2",
@@ -1459,7 +1439,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_UP_EXP:                "blk.{bid}.ffn_up_exps",
     MODEL_TENSOR.FFN_GATE_UP_EXP:           "blk.{bid}.ffn_gate_up_exps",
     MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
-    MODEL_TENSOR.FFN_EXP_PROBS_B_VL:        "blk.{bid}.exp_probs_b_vl",
     MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
     MODEL_TENSOR.MOE_LATENT_DOWN:           "blk.{bid}.ffn_latent_down",      # nemotron 3 super
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
@@ -1710,9 +1689,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_RESMPL_PROJ:             "resampler.proj",
     MODEL_TENSOR.V_RESMPL_QUERY:            "resampler.query",
     MODEL_TENSOR.V_TOK_EMBD_IMG_BREAK:      "v.token_embd.img_break", # pixtral
-    MODEL_TENSOR.V_TOK_EMBD_IMG_START:      "v.token_embd.img_start", # deepseek4v
-    MODEL_TENSOR.V_TOK_EMBD_IMG_END:        "v.token_embd.img_end",   # deepseek4v
-    MODEL_TENSOR.V_TOK_EMBD_IMG_PAD:        "v.token_embd.img_pad",   # deepseek4v
     MODEL_TENSOR.V_MM_PATCH_MERGER:         "mm.patch_merger", # mistral small 3.1
     MODEL_TENSOR.V_DS_NORM:                 "v.deepstack.{bid}.norm",
     MODEL_TENSOR.V_DS_FC1:                  "v.deepstack.{bid}.fc1",
@@ -1969,20 +1945,15 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
-    MODEL_TENSOR.NEXTN_HC_HEAD_NORM:        "blk.{bid}.nextn.hc_head_norm",
-    MODEL_TENSOR.NEXTN_HC_HEAD_DOWN:        "blk.{bid}.nextn.hc_head_down",
-    MODEL_TENSOR.NEXTN_HC_HEAD_UP:          "blk.{bid}.nextn.hc_head_up",
+    MODEL_TENSOR.NEXTN_FC_EMBD:             "blk.{bid}.nextn.fc_embd",
+    MODEL_TENSOR.NEXTN_FC_HIDDEN:           "blk.{bid}.nextn.fc_hidden",
+    MODEL_TENSOR.NEXTN_HC_NORM:             "blk.{bid}.nextn.hc_norm",
+    MODEL_TENSOR.NEXTN_HC_DOWN:             "blk.{bid}.nextn.hc_down",
+    MODEL_TENSOR.NEXTN_HC_UP:               "blk.{bid}.nextn.hc_up",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
-    MODEL_TENSOR.DFLASH_ATTN_CONV_BASE:     "blk.{bid}.attn_conv_base",
-    MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ:     "blk.{bid}.attn_conv_proj",
-    MODEL_TENSOR.DFLASH_FFN_CONV_BASE:      "blk.{bid}.ffn_conv_base",
-    MODEL_TENSOR.DFLASH_FFN_CONV_PROJ:      "blk.{bid}.ffn_conv_proj",
-    MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
-    MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
-    MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
     MODEL_TENSOR.D2T:                       "d2t",
 }
 
@@ -2050,9 +2021,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_RESMPL_PROJ,
         MODEL_TENSOR.V_RESMPL_QUERY,
         MODEL_TENSOR.V_TOK_EMBD_IMG_BREAK,
-        MODEL_TENSOR.V_TOK_EMBD_IMG_START,
-        MODEL_TENSOR.V_TOK_EMBD_IMG_END,
-        MODEL_TENSOR.V_TOK_EMBD_IMG_PAD,
         MODEL_TENSOR.V_MM_PATCH_MERGER,
         MODEL_TENSOR.V_MM_MERGER_FC1,
         MODEL_TENSOR.V_MM_MERGER_FC2,
@@ -2937,18 +2905,13 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PLE_NORM_QUERY,
         MODEL_TENSOR.PLE_NORM_CONV,
         MODEL_TENSOR.PLE_CONV1D,
-        MODEL_TENSOR.ATTN_NORM,
-        MODEL_TENSOR.FFN_NORM,
-        MODEL_TENSOR.LAYER_OUT_NORM,
-        MODEL_TENSOR.NEXTN_EH_PROJ,
-        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
+        MODEL_TENSOR.NEXTN_FC_EMBD,
+        MODEL_TENSOR.NEXTN_FC_HIDDEN,
+        MODEL_TENSOR.NEXTN_HC_NORM,
+        MODEL_TENSOR.NEXTN_HC_DOWN,
+        MODEL_TENSOR.NEXTN_HC_UP,
         MODEL_TENSOR.NEXTN_ENORM,
         MODEL_TENSOR.NEXTN_HNORM,
-        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
-        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
-        MODEL_TENSOR.NEXTN_HC_HEAD_NORM,
-        MODEL_TENSOR.NEXTN_HC_HEAD_DOWN,
-        MODEL_TENSOR.NEXTN_HC_HEAD_UP,
     ],
     MODEL_ARCH.PLAMO: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -3865,7 +3828,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_INP,
         MODEL_TENSOR.FFN_GATE_TID2EID,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
-        MODEL_TENSOR.FFN_EXP_PROBS_B_VL,
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
@@ -4763,48 +4725,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
-    MODEL_ARCH.HY_V4: [
-        MODEL_TENSOR.TOKEN_EMBD,
-        MODEL_TENSOR.OUTPUT_NORM,
-        MODEL_TENSOR.OUTPUT,
-        MODEL_TENSOR.ROPE_FREQS,
-        MODEL_TENSOR.HC_HEAD_FN,
-        MODEL_TENSOR.HC_HEAD_BASE,
-        MODEL_TENSOR.HC_HEAD_SCALE,
-        MODEL_TENSOR.ATTN_NORM,
-        MODEL_TENSOR.ATTN_SINKS,
-        MODEL_TENSOR.ATTN_Q_A,
-        MODEL_TENSOR.ATTN_Q_A_NORM,
-        MODEL_TENSOR.ATTN_Q_B,
-        MODEL_TENSOR.ATTN_KV_A_MQA,
-        MODEL_TENSOR.ATTN_KV_A_NORM,
-        MODEL_TENSOR.ATTN_K_B,
-        MODEL_TENSOR.ATTN_V_B,
-        MODEL_TENSOR.ATTN_OUT,
-        MODEL_TENSOR.ATTN_GATE,
-        MODEL_TENSOR.INDEXER_K_NORM,
-        MODEL_TENSOR.INDEXER_PROJ,
-        MODEL_TENSOR.INDEXER_ATTN_K,
-        MODEL_TENSOR.INDEXER_ATTN_Q_B,
-        MODEL_TENSOR.HC_ATTN_FN,
-        MODEL_TENSOR.HC_ATTN_BASE,
-        MODEL_TENSOR.HC_ATTN_SCALE,
-        MODEL_TENSOR.HC_FFN_FN,
-        MODEL_TENSOR.HC_FFN_BASE,
-        MODEL_TENSOR.HC_FFN_SCALE,
-        MODEL_TENSOR.FFN_GATE_INP,
-        MODEL_TENSOR.FFN_EXP_PROBS_B,
-        MODEL_TENSOR.FFN_NORM,
-        MODEL_TENSOR.FFN_GATE,
-        MODEL_TENSOR.FFN_DOWN,
-        MODEL_TENSOR.FFN_UP,
-        MODEL_TENSOR.FFN_GATE_EXP,
-        MODEL_TENSOR.FFN_DOWN_EXP,
-        MODEL_TENSOR.FFN_UP_EXP,
-        MODEL_TENSOR.FFN_GATE_SHEXP,
-        MODEL_TENSOR.FFN_DOWN_SHEXP,
-        MODEL_TENSOR.FFN_UP_SHEXP,
-    ],
     MODEL_ARCH.SMOLLM3: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -5151,13 +5071,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DSPARK_MARKOV_W1,
         MODEL_TENSOR.DSPARK_MARKOV_W2,
         MODEL_TENSOR.DSPARK_CONF_PROJ,
-        MODEL_TENSOR.DFLASH_ATTN_CONV_BASE,
-        MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ,
-        MODEL_TENSOR.DFLASH_FFN_CONV_BASE,
-        MODEL_TENSOR.DFLASH_FFN_CONV_PROJ,
-        MODEL_TENSOR.DFLASH_SELECTOR_PREV,
-        MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
-        MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5504,10 +5417,6 @@ MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.ATTN_ROT_EMBD,
     ],
-    MODEL_ARCH.HY_V4: [
-        MODEL_TENSOR.ROPE_FREQS,
-        MODEL_TENSOR.ATTN_ROT_EMBD,
-    ],
     MODEL_ARCH.CHATGLM: [
         MODEL_TENSOR.ROPE_FREQS,
     ],
@@ -5593,6 +5502,7 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    Q3_PLE  = 43
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5727,7 +5637,6 @@ class VisionProjectorType:
     DOTS3NOTE_A = "dots3note_a" # audio
     DEEPSEEKOCR = "deepseekocr"
     DEEPSEEKOCR2 = "deepseekocr2"
-    DEEPSEEK4V = "deepseek4v"
     LFM2A = "lfm2a" # audio
     MUSIC_FLAMINGO = "musicflamingo" # audio
     GLM4V = "glm4v"
@@ -5786,6 +5695,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.Q3_PLE:  (32, 14),
 }
 
 

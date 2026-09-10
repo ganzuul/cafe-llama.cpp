@@ -1647,7 +1647,14 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
     common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        // mixed-capability pair: the target may support partial removal (e.g. via the
+        // recurrent rollback ring) while a recurrent draft model does not. the draft cache
+        // is a pure optimization, so instead of aborting, drop the whole draft sequence and
+        // let the driver re-prime it from the prompt on the next draft call.
+        auto * mem = llama_get_memory(ctx_dft);
+        if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
+            llama_memory_seq_rm(mem, seq_id, -1, -1);
+        }
     }
 }
 
@@ -1688,9 +1695,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
-    mparams.lazy_mode         = params.lazy_mode;
-    mparams.load_ngram        = params.load_ngram;
-    mparams.offload_ngram_ssd = params.offload_ngram_ssd;
+    mparams.tensor_read_lazy = params.tensor_read_lazy;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
@@ -1748,7 +1753,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
-    cparams.pipeline_parallel = params.pipeline_parallel;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 

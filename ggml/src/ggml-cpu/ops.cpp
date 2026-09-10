@@ -5176,6 +5176,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_Q3_PLE:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -12160,5 +12161,108 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+
+// ggml_compute_forward_moe_branch_ids
+
+void ggml_compute_forward_moe_branch_ids(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * ids = dst->src[0];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == ids->ne[0] && dst->ne[1] == ids->ne[1]);
+
+    const int32_t lo        = ggml_get_op_params_i32(dst, 0);
+    const int32_t hi        = ggml_get_op_params_i32(dst, 1);
+    const int32_t mask_base = ggml_get_op_params_i32(dst, 2);
+
+    for (int64_t i1 = params->ith; i1 < dst->ne[1]; i1 += params->nth) {
+        const int32_t * src_row = (const int32_t *) ((const char *) ids->data + i1*ids->nb[1]);
+              int32_t * dst_row =       (int32_t *) ((      char *) dst->data + i1*dst->nb[1]);
+
+        for (int64_t i0 = 0; i0 < dst->ne[0]; i0++) {
+            const int32_t id = src_row[i0*ids->nb[0]/sizeof(int32_t)];
+            dst_row[i0] = id >= lo && id < hi ? id - lo : mask_base + (int32_t) i0;
+        }
+    }
+}
+
+// ggml_compute_forward_moe_expert_gather
+//
+// For each token t and expert index e in ids:
+//   out[:, e, t] = as[:, :, ids[e, t]]  (row from expert tensor)
+void ggml_compute_forward_moe_expert_gather(const ggml_compute_params * params, ggml_tensor * dst) {
+    // [MVP] Performance hook: measure CPU gather time
+    int64_t gather_start_us = ggml_time_us();
+
+    // [Gap 3] Callback pointer for signaling GPU-side event recording.
+    // Thread 0 invokes this after gather completes to record the CUDA event.
+    // Read from params->cb_data (set by CUDA dispatch) or dst->extra (set by graph construction).
+    void (*gather_complete_cb)(void *) = NULL;
+    void * gather_cb_ctx = params->cb_data;
+    if (!gather_cb_ctx) {
+        gather_cb_ctx = dst->extra;  // fallback: tensor extra field set by graph construction
+    }
+    if (gather_cb_ctx) {
+        gather_complete_cb = (void (*)(void *))gather_cb_ctx;
+    }
+
+    const ggml_tensor * as  = dst->src[0];
+    const ggml_tensor * ids = dst->src[1];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+
+    const int64_t ne01 = dst->ne[0]; // flattened expert dimension (ne0 * ne1 of as)
+    const int64_t ne1  = dst->ne[1]; // n_expert_used
+    const int64_t ne2  = dst->ne[2]; // n_tokens
+    const int64_t n_expert = as->ne[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Each thread handles a subset of expert tokens (ne1 * ne2)
+    const int64_t total_expert_tokens = ne1 * ne2;
+    const int64_t tokens_per_thread = (total_expert_tokens + nth - 1) / nth;
+    const int64_t token_start = ith * tokens_per_thread;
+    const int64_t token_end   = MIN(token_start + tokens_per_thread, total_expert_tokens);
+
+    for (int64_t token_idx = token_start; token_idx < token_end; token_idx++) {
+        const int64_t e = token_idx / ne2;  // expert index in output
+        const int64_t t = token_idx % ne2;  // token index
+
+        // Read expert id from ids tensor
+        const int32_t expert_id = *(const int32_t *) ((const char *) ids->data + e * ids->nb[0] + t * ids->nb[1]);
+
+        // Pointer to output row
+        float * dst_row = (float *) ((char *) dst->data + e * dst->nb[1] + t * dst->nb[2]);
+
+        // Validate expert ID — zero-fill on invalid
+        if (expert_id < 0 || expert_id >= (int32_t) n_expert) {
+            memset(dst_row, 0, ne01 * sizeof(float));
+            continue;
+        }
+
+        // Copy expert weights from source tensor
+        // Expert e's weights are at as->data + expert_id * as->nb[2]
+        const float * src_expert = (const float *) ((const char *) as->data + expert_id * as->nb[2]);
+        memcpy(dst_row, src_expert, ne01 * sizeof(float));
+    }
+
+    // [MVP] Performance hook: log gather time
+    int64_t gather_end_us = ggml_time_us();
+    int64_t gather_us = gather_end_us - gather_start_us;
+    GGML_LOG_DEBUG("moe_expert_gather: ne01=%lld ne1=%lld ne2=%lld time=%lld us (%.2f ms)",
+            (long long)ne01, (long long)ne1, (long long)ne2, (long long)gather_us, gather_us / 1000.0);
+
+    // [Gap 3] Signal completion to GPU: thread 0 invokes callback to record CUDA event.
+    // This enables the GPU matmul for the next layer to wait on gather completion
+    // instead of waiting on the previous matmul (enabling double-buffering).
+    if (ith == 0 && gather_complete_cb) {
+        gather_complete_cb(params->cb_data);
     }
 }

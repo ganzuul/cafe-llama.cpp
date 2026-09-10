@@ -951,7 +951,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         case GGML_OP_MUL_MAT_ID:
             {
                 // Used for either MoE expert routing or embedded adapter routing
-                const int n_ids_used = hparams.router_layer >= 0 ? 1 : hparams.n_expert_used_max();
+                const int n_ids_used = hparams.router_layer >= 0 ? 1 : hparams.n_expert_used;
                 GGML_ASSERT(n_ids_used > 0);
                 ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
@@ -964,7 +964,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             } break;
         case GGML_OP_ADD_ID:
             {
-                const int n_expert_used = hparams.n_expert_used_max();
+                const int n_expert_used = hparams.n_expert_used;
                 GGML_ASSERT(n_expert_used > 0);
                 ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_expert_used, 512);
                 ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
@@ -1070,118 +1070,11 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
-ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
-    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    if (!cpu_dev) {
-        throw std::runtime_error("no CPU backend found");
-    }
-    return ggml_backend_dev_buffer_type(cpu_dev);
-}
-
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force) {
-    if (mode == LLAMA_LAZY_MODE_OFF && !force) {
-        return false;
-    }
-
-    // do not lazy-read small tensors, it has significant overhead and is not worth it
-    constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (!force && mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
-        return false;
-    }
-
-    if (!llama_mmap::SUPPORTED) {
-        LLAMA_LOG_WARN("%s: mmap is not available, so tensor %s (size = %zu MiB) is loaded into RAM in full\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
-        return false;
-    }
-
-    if (w) {
-        ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
-        tensors.insert(name);
-
-        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
-    }
-
-    return true;
-}
-
-void llama_model_loader::lazy_read::skip(const llama_tensor_weight & w) {
-    ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
-}
-
-// declared in llama-model.h, which this file does not include
-const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
-
-struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne) {
-    // checked first so no other tensor in any model pays a metadata lookup
-    if (tn.tensor != LLM_TENSOR_TOKEN_EMBD && tn.tensor != LLM_TENSOR_OUTPUT && tn.tensor != LLM_TENSOR_OUTPUT_NORM) {
-        return nullptr;
-    }
-
-    if (shared_target_tensors < 0) {
-        bool shared = false;
-        get_key(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, shared, false);
-        shared_target_tensors = shared ? 1 : 0;
-    }
-    if (shared_target_tensors == 0) {
-        return nullptr;
-    }
-
-    const std::string name = tn.str();
-    if (get_weight(name.c_str()) != nullptr) {
-        return nullptr;
-    }
-
-    if (model_shared == nullptr) {
-        throw std::runtime_error(format("%s: this model is a draft head without its own '%s'; "
-                    "load it as a draft of its target model, not on its own", __func__, name.c_str()));
-    }
-
-    ggml_tensor * src = nullptr;
-    for (const auto & [n, t] : llama_internal_get_tensor_map(model_shared)) {
-        if (n == name) {
-            src = t;
-            break;
-        }
-    }
-    if (src == nullptr) {
-        throw std::runtime_error(format("%s: draft needs tensor '%s' from the target, which does not have it",
-                    __func__, name.c_str()));
-    }
-
-    // used directly, so the shapes must agree exactly
-    size_t dim = 0;
-    for (const int64_t n : ne) {
-        if (dim >= GGML_MAX_DIMS || src->ne[dim] != n) {
-            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
-                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
-        }
-        dim++;
-    }
-    for (; dim < GGML_MAX_DIMS; dim++) {
-        if (src->ne[dim] != 1) {
-            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
-                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
-        }
-    }
-
-    LLAMA_LOG_INFO("%s: tensor %s taken from the target model\n", __func__, name.c_str());
-
-    // not counted in n_created/size_data: not in this file, neither allocated nor freed here
-    return src;
-}
-
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    // set below, before buft_for_tensor() runs
-    bool is_lazy = false;
-
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
-
-        auto it = ctx_map.find(key);
+        auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             // one ggml context per buffer type
             int max_n_tensors = n_tensors;
@@ -1203,7 +1096,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error(format("failed to create ggml context"));
             }
 
-            ctx_map.emplace(key, ctx);
+            ctx_map.emplace(buft, ctx);
 
             return ctx;
         }
@@ -1238,13 +1131,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
-            if (use_mmap) {
-                const auto * w = get_weight(tn.str().c_str());
-                if (w) {
-                    lazy.skip(*w);
-                }
-            }
-
             size_data -= nbytes;
             n_created++;
 
@@ -1274,10 +1160,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        if (is_lazy) {
-            return lazy_read::buft();
-        }
-
         // select the buffer type for this tensor
         const buft_list_t * buft_list;
         switch (info.layer) {
@@ -1296,6 +1178,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        bool keep_explicit_host_with_mmap = false;
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1314,6 +1197,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        auto * override_dev = ggml_backend_buft_get_device(buft);
+                        keep_explicit_host_with_mmap = override_dev &&
+                            buft == ggml_backend_dev_host_buffer_type(override_dev);
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1332,9 +1218,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        // Automatic host buffers are demoted under mmap, but an explicit CUDA_Host override
+        // is intentional: allocate it and copy that tensor while lazy tensors remain mapped.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) && !keep_explicit_host_with_mmap) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -1399,25 +1286,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return ret;
     }
 
-    // must run before check_tensor_dims: the tensor is absent from this file by design, and for
-    // the lm head it must also win over the arch fallback that ties the head to token_embd
-    if (ggml_tensor * shared = borrow_shared_tensor(tn, ne)) {
-        return shared;
-    }
-
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
-        // --ngram-ssd pins the table to disk whatever --lazy-mode says
-        const bool force = offload_ngram_ssd &&
-            tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD && hparams.ple_n_heads > 0;
+    if ((flags & TENSOR_READ_LAZY) && use_mmap && tensor_read_lazy != LLAMA_TENSOR_READ_LAZY_OFF) {
+        // in auto mode, small tensors are cheap enough to keep resident
+        constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
+        if (tensor_read_lazy == LLAMA_TENSOR_READ_LAZY_ON || ggml_nbytes(cur) > auto_lazy_min_size) {
+            const auto & w = require_weight(tn.str().c_str());
+            lazy_tensor_ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(cur));
 
-        // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()), force);
+            LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
+                    __func__, tn.str().c_str(), ggml_nbytes(cur)/1024/1024);
+        }
     }
 
     ggml_tensor t_meta = *cur;
@@ -1484,8 +1368,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
-    // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
-    if (use_mmap || lazy.any()) {
+    if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
@@ -1502,10 +1385,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            const auto it_lazy = lazy_tensor_ranges.find(idx);
+            static const llama_mmap::ranges no_lazy_ranges;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa,
+                    it_lazy != lazy_tensor_ranges.end() ? it_lazy->second : no_lazy_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1544,26 +1428,27 @@ void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
     mappings.at(w.idx)->unmap_fragment(w.offs, w.offs + ggml_nbytes(w.tensor));
 }
 
-const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const {
-    GGML_ASSERT(offs + size <= ggml_nbytes(w.tensor));
-
-    const void * data = buf;
+void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
+    const auto & w = require_weight(ggml_get_name(cur));
 
     if (use_mmap) {
-        data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;
+        const auto & mapping = mappings.at(w.idx);
+        if (cur->data == nullptr) {
+            cur->data = (uint8_t *)mapping->addr() + w.offs;
+        } else {
+            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
+        }
     } else {
-        GGML_ASSERT(buf != nullptr);
+        GGML_ASSERT(cur->data != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
-        file->seek(w.offs + offs, SEEK_SET);
-        file->read_raw(buf, size);
+        file->seek(w.offs, SEEK_SET);
+        file->read_raw(cur->data, ggml_nbytes(cur));
     }
 
-    if (check_tensors && !ggml_validate_row_data(w.tensor->type, data, size)) {
-        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(w.tensor)));
+    if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
+        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
     }
-
-    return data;
 }
 
 bool llama_model_loader::load_all_data(
@@ -1580,6 +1465,7 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
@@ -1680,25 +1566,7 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
-    std::vector<ggml_tensor *> tensors;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
-        tensors.push_back(cur);
-    }
-
-    // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
-    // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
-    if (!use_mmap) {
-        std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
-            const bool staged_a = a->buffer && !ggml_backend_buffer_is_host(a->buffer);
-            const bool staged_b = b->buffer && !ggml_backend_buffer_is_host(b->buffer);
-            if (staged_a != staged_b) {
-                return staged_a;
-            }
-            return staged_a && ggml_nbytes(a) > ggml_nbytes(b);
-        });
-    }
-
-    for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
@@ -1713,9 +1581,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
-
-        if (from_mapping) {
+        if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
@@ -1732,9 +1598,7 @@ bool llama_model_loader::load_all_data(
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
-
-                // locking a lazy tensor would fault all of it in, which is what lazy avoids
-                if (lmlocks && !lazy.has(cur)) {
+                if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
                     lmlock->grow_to(weight->offs + n_size);
                 }
@@ -1811,8 +1675,7 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
-                    // scoped to one tensor so only one staging buffer is alive at a time
-                    std::vector<no_init<uint8_t>> read_buf(n_size);
+                    read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);

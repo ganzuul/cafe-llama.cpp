@@ -52,7 +52,6 @@
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
-#define GGML_CUDA_CC_ORIN            870
 #define GGML_CUDA_CC_ADA_LOVELACE    890
 #define GGML_CUDA_CC_HOPPER          900
 // While BW spans CC 1000, 1100 & 1200, we are integrating Tensor Core instructions available to 1200 family, see
@@ -1412,6 +1411,52 @@ struct ggml_cuda_stream_context {
         concurrent_events.clear();
     }
 };
+
+// [Gap 3] MOE gather stream context for CUDA stream overlap.
+// Manages a dedicated non-blocking stream for CPU-side expert gather
+// and a CUDA event for synchronization with GPU matmul.
+//
+// Double-buffering pattern (from PR #25294):
+//   Layer N:   GPU computes matmul on main stream
+//   Layer N:   CPU prefetches layer N+1's experts on gather stream (async)
+//   Layer N:   CPU gather completes, records event on gather stream
+//   Layer N+1: GPU matmul waits on gather event, then runs on main stream
+//
+// This hides PCIe/CPU latency behind GPU compute, achieving ~6.3 tok/s
+// projected vs 4.7 tok/s without double-buffering.
+struct ggml_moe_gather_stream_ctx {
+    cudaStream_t gather_stream = nullptr;  // dedicated stream for CPU gather
+    cudaEvent_t  gather_done_event = nullptr;  // records when gather completes
+    int device = -1;
+
+    void init(int dev) {
+        if (device >= 0) return;  // already initialized
+        device = dev;
+        ggml_cuda_set_device(device);
+
+        // Create a non-blocking stream for CPU gather
+        CUDA_CHECK(cudaStreamCreateWithFlags(&gather_stream, cudaStreamNonBlocking));
+
+        // Create an event for gather completion synchronization
+        CUDA_CHECK(cudaEventCreateWithFlags(&gather_done_event, cudaEventDefault));
+    }
+
+    void destroy() {
+        if (gather_stream) {
+            CUDA_CHECK(cudaStreamDestroy(gather_stream));
+            gather_stream = nullptr;
+        }
+        if (gather_done_event) {
+            CUDA_CHECK(cudaEventDestroy(gather_done_event));
+            gather_done_event = nullptr;
+        }
+        device = -1;
+    }
+
+    ~ggml_moe_gather_stream_ctx() {
+        destroy();
+    }
+};
 struct ggml_cuda_expert_lru_cache {
     struct entry {
         void * dev_ptr = nullptr;
@@ -1537,6 +1582,130 @@ struct ggml_cuda_expert_lru_cache {
     }
 };
 
+// Staging buffer manager for MOE expert gather MVP.
+// Manages pinned memory staging buffers for hot/cold expert routing.
+// Hot experts: copied from GPU cache to staging (fast, stays on GPU)
+// Cold experts: read from RAM to staging (slower, PCIe transfer)
+struct ggml_moe_staging_manager {
+    struct staging_entry {
+        void * pinned_ptr = nullptr;   // pinned host memory (CPU accessible)
+        void * dev_ptr = nullptr;      // device memory (GPU accessible)
+        size_t size = 0;
+        uint64_t last_used = 0;
+        int expert_id = -1;
+    };
+
+    int device = 0;
+    size_t max_bytes = 0;
+    size_t current_bytes = 0;
+    uint64_t step_counter = 0;
+    bool initialized = false;
+
+    std::vector<staging_entry> entries;  // linear scan for LRU (small N)
+
+    void init(int dev, size_t max_mb = 1024) {
+        if (initialized) {
+            return;
+        }
+        device = dev;
+        max_bytes = (size_t)max_mb * 1024 * 1024;
+        initialized = true;
+    }
+
+    // Get staging buffer for an expert. Returns pinned_ptr for CPU, dev_ptr for GPU.
+    // Sets out_is_hot=true if the expert was already cached (hot), false if cold.
+    staging_entry * get_staging(int expert_id, size_t size, cudaStream_t stream, bool & out_is_hot) {
+        if (!initialized) {
+            init(device);
+        }
+
+        out_is_hot = false;
+        ++step_counter;
+
+        // Linear scan for existing entry (small N experts)
+        for (auto & entry : entries) {
+            if (entry.expert_id == expert_id) {
+                entry.last_used = step_counter;
+                out_is_hot = true;
+                return &entry;
+            }
+        }
+
+        // Evict LRU entry if needed
+        if (current_bytes + size > max_bytes && !entries.empty()) {
+            int lru_idx = 0;
+            uint64_t lru_time = entries[0].last_used;
+            for (int i = 1; i < (int)entries.size(); ++i) {
+                if (entries[i].last_used < lru_time) {
+                    lru_time = entries[i].last_used;
+                    lru_idx = i;
+                }
+            }
+            auto & evict = entries[lru_idx];
+            if (evict.pinned_ptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaFreeHost(evict.pinned_ptr));
+            }
+            if (evict.dev_ptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaFree(evict.dev_ptr));
+            }
+            current_bytes -= evict.size;
+            entries.erase(entries.begin() + lru_idx);
+        }
+
+        // Allocate new staging entry
+        staging_entry new_entry;
+        new_entry.expert_id = expert_id;
+        new_entry.size = size;
+
+        // Allocate pinned host memory (CPU accessible)
+        ggml_cuda_set_device(device);
+        cudaError_t err = cudaMallocHost(&new_entry.pinned_ptr, size);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            clear();
+            return nullptr;
+        }
+
+        // Allocate device memory (GPU accessible)
+        err = cudaMalloc(&new_entry.dev_ptr, size);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            CUDA_CHECK(cudaFreeHost(new_entry.pinned_ptr));
+            new_entry.pinned_ptr = nullptr;
+            clear();
+            return nullptr;
+        }
+
+        new_entry.last_used = step_counter;
+        entries.push_back(new_entry);
+        current_bytes += size;
+
+        return &entries.back();
+    }
+
+    void clear() {
+        if (!entries.empty()) {
+            ggml_cuda_set_device(device);
+            for (auto & entry : entries) {
+                if (entry.pinned_ptr) {
+                    CUDA_CHECK(cudaFreeHost(entry.pinned_ptr));
+                }
+                if (entry.dev_ptr) {
+                    CUDA_CHECK(cudaFree(entry.dev_ptr));
+                }
+            }
+            entries.clear();
+            current_bytes = 0;
+        }
+    }
+
+    ~ggml_moe_staging_manager() {
+        clear();
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1550,18 +1719,13 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from graph key to cuda_graph - allows multiple graphs per context when the
-    // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same
-    // split is called with different tensor shapes (e.g. a speculative verify batch)
-    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
-
-    // a cuda graph instance is only valid for the shapes it captured, so a caller that
-    // alternates shapes needs one instance per shape to stay on the graph path
-    static const size_t max_cuda_graphs = 64;
+    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
+    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1576,19 +1740,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(graph_key);
+        auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
-            // a workload with many distinct shapes must not grow this without bound
-            while (cuda_graphs.size() >= max_cuda_graphs) {
-                auto lru = cuda_graphs.begin();
-                for (auto c = cuda_graphs.begin(); c != cuda_graphs.end(); ++c) {
-                    if (c->second->last_used_time < lru->second->last_used_time) {
-                        lru = c;
-                    }
-                }
-                cuda_graphs.erase(lru);
-            }
-            it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
@@ -1620,9 +1774,17 @@ struct ggml_backend_cuda_context {
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
         expert_cache.init(device);
+        staging_mgr.init(device);
+        moe_gather_stream.init(device);
     }
 
     ggml_cuda_expert_lru_cache expert_cache;
+
+    // [MVP] Staging buffer manager for hot/cold expert routing
+    ggml_moe_staging_manager staging_mgr;
+
+    // [Gap 3] MOE gather stream context for CUDA stream overlap
+    ggml_moe_gather_stream_ctx moe_gather_stream;
 
     ggml_cuda_stream_context concurrent_stream_context;
 
@@ -1682,7 +1844,6 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
-    float glu_limit = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1691,7 +1852,6 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
-    float glu_limit = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {
@@ -1818,3 +1978,4 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+

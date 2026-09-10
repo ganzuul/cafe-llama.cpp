@@ -129,11 +129,17 @@ struct llama_model_loader {
     // cached nextn_shared_target_tensors, -1 until first read
     int shared_target_tensors = -1;
 
+    // set by the caller before the create_tensor() calls
+    enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
 
     llama_mmaps mappings;
+
+    // byte ranges of TENSOR_READ_LAZY tensors, per file index
+    std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;

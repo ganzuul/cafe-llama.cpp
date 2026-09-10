@@ -976,7 +976,7 @@ static struct random_gguf_context_result get_random_gguf_context(ggml_backend_t 
     }
 
     struct ggml_init_params ggml_params = {
-        /*.mem_size   =*/ 256*ggml_tensor_overhead(),
+        /*.mem_size   =*/ 257*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -1000,6 +1000,15 @@ static struct random_gguf_context_result get_random_gguf_context(ggml_backend_t 
 
         struct ggml_tensor * tensor = ggml_new_tensor(ctx, type, n_dims, ne);
         ggml_set_name(tensor, name.c_str());
+    }
+
+    // Always cover the PLE-only type in the GGUF round-trip, independent of
+    // the random type selection above. The first dimension matches the real
+    // Qwen3.8 Flash-Next PLE row width.
+    {
+        int64_t ne[2] = {160, 3};
+        struct ggml_tensor * tensor = ggml_new_tensor(ctx, GGML_TYPE_Q3_PLE, 2, ne);
+        ggml_set_name(tensor, "per_layer_token_embd.weight");
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -1422,6 +1431,87 @@ static void print_usage() {
     printf("  if no seed is unspecified then a random seed is used\n");
 }
 
+
+
+static bool test_q3_ple_split_gguf() {
+    bool ok = true;
+
+    for (uint16_t split = 0; split < 2; ++split) {
+        FILE * file = tmpfile();
+        if (file == nullptr) {
+            printf("test_q3_ple_split_gguf: tmpfile failed\n");
+            return false;
+        }
+
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ 4096,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ false,
+        };
+        ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx != nullptr);
+
+        ggml_tensor * tensor = split == 0
+            ? ggml_new_tensor_2d(ctx, GGML_TYPE_Q3_PLE, 160, 1)
+            : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
+        ggml_set_name(tensor, split == 0 ? "per_layer_token_embd.weight" : "tiny.weight");
+        memset(tensor->data, 0, ggml_nbytes(tensor));
+
+        gguf_context * gguf = gguf_init_empty();
+        gguf_set_val_u16(gguf, "split.no", split);
+        gguf_set_val_u16(gguf, "split.count", 2);
+        gguf_set_val_i32(gguf, "split.tensors.count", 2);
+        gguf_add_tensor(gguf, tensor);
+        gguf_write_to_file_ptr(gguf, file, false);
+        rewind(file);
+
+        ggml_context * read_ctx = nullptr;
+        struct gguf_init_params read_params = {
+            /*.no_alloc =*/ false,
+            /*.ctx      =*/ &read_ctx,
+        };
+        gguf_context * read_gguf = gguf_init_from_file_ptr(file, read_params);
+        if (read_gguf == nullptr || read_ctx == nullptr) {
+            ok = false;
+        } else {
+            const int64_t split_no_key = gguf_find_key(read_gguf, "split.no");
+            const int64_t split_count_key = gguf_find_key(read_gguf, "split.count");
+            const int64_t tensor_count_key = gguf_find_key(read_gguf, "split.tensors.count");
+            const char * expected_name = split == 0 ? "per_layer_token_embd.weight" : "tiny.weight";
+            const ggml_type expected_type = split == 0 ? GGML_TYPE_Q3_PLE : GGML_TYPE_F32;
+            const size_t expected_size = split == 0 ? 70 : 16;
+            const int64_t tensor_id = gguf_find_tensor(read_gguf, expected_name);
+
+            ok = ok && split_no_key >= 0 && split_count_key >= 0 && tensor_count_key >= 0 &&
+                gguf_get_val_u16(read_gguf, split_no_key) == split &&
+                gguf_get_val_u16(read_gguf, split_count_key) == 2 &&
+                gguf_get_val_i32(read_gguf, tensor_count_key) == 2 &&
+                gguf_get_n_tensors(read_gguf) == 1 &&
+                tensor_id >= 0;
+            if (tensor_id >= 0) {
+                ok = ok && strcmp(gguf_get_tensor_name(read_gguf, tensor_id), expected_name) == 0 &&
+                    gguf_get_tensor_type(read_gguf, tensor_id) == expected_type &&
+                    gguf_get_tensor_size(read_gguf, tensor_id) == expected_size &&
+                    gguf_get_tensor_offset(read_gguf, tensor_id) == 0;
+            }
+        }
+
+        if (read_ctx != nullptr) {
+            ggml_free(read_ctx);
+        }
+        if (read_gguf != nullptr) {
+            gguf_free(read_gguf);
+        }
+        gguf_free(gguf);
+        ggml_free(ctx);
+        fclose(file);
+    }
+
+    printf("test_q3_ple_split_gguf: %s\n\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
+
 int main(int argc, char ** argv) {
     if (argc > 2) {
         print_usage();
@@ -1437,6 +1527,8 @@ int main(int argc, char ** argv) {
 
     int npass = 0;
     int ntest = 0;
+    npass += test_q3_ple_split_gguf() ? 1 : 0;
+    ntest++;
     {
         std::pair<int, int> result = test_handcrafted_file(seed);
         npass += result.first;

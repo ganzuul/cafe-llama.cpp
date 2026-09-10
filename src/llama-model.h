@@ -128,7 +128,6 @@ enum llm_type {
     LLM_TYPE_31B_A3_5B,
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
-    LLM_TYPE_75B_A9B, // Nemotron 3 Puzzle
     LLM_TYPE_80B_A3B, // Qwen3 Next
     LLM_TYPE_A3B,     // Qwen3.8 Flash Next
     LLM_TYPE_100B_A6B,
@@ -229,11 +228,12 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
 
-    // qwen4exp: the MTP head's own final hyper-connection mixer, which stands in for both
-    // the stream collapse and the output norm (the trunk has no separate output_norm)
-    struct ggml_tensor * hc_head_norm          = nullptr;
-    struct ggml_tensor * hc_head_down          = nullptr;
-    struct ggml_tensor * hc_head_up            = nullptr;
+    // qwen4exp MTP glue
+    struct ggml_tensor * fc_embd   = nullptr;
+    struct ggml_tensor * fc_hidden = nullptr;
+    struct ggml_tensor * hc_norm   = nullptr;
+    struct ggml_tensor * hc_down   = nullptr;
+    struct ggml_tensor * hc_up     = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -336,6 +336,15 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
+
+    struct ggml_tensor * ffn_gate_up_exps_hot  = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps_cold = nullptr;
+    struct ggml_tensor * ffn_gate_exps_hot  = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot  = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot    = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold   = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
@@ -369,13 +378,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
-    struct ggml_tensor * ffn_exp_probs_b_vl = nullptr; // deepseek4 vision (bias for image tokens)
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
-
-    struct ggml_tensor * dflash_attn_conv_base = nullptr;
-    struct ggml_tensor * dflash_attn_conv_proj = nullptr;
-    struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
-    struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -680,13 +683,8 @@ struct llama_model {
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;
     struct ggml_tensor * dspark_markov_w2   = nullptr;
-    struct ggml_tensor * dspark_markov_w2_s = nullptr;
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
-
-    struct ggml_tensor * dflash_selector_prev   = nullptr;
-    struct ggml_tensor * dflash_selector_next   = nullptr;
-    struct ggml_tensor * dflash_selector_hidden = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
@@ -808,6 +806,8 @@ struct llama_model_base : public llama_model {
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
+    void create_tensor_down_exps(llama_layer & layer, int bid, int64_t n_ff_,
+            int64_t n_embd_, int64_t n_expert_, int flags);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,
@@ -846,7 +846,7 @@ const char * llm_type_name(llm_type type);
     const int64_t n_token_types  = vocab.n_token_types();    GGML_UNUSED(n_token_types); \
     const int64_t n_rot          = hparams.n_rot();          GGML_UNUSED(n_rot); \
     const int64_t n_expert       = hparams.n_expert;         GGML_UNUSED(n_expert); \
-    const int64_t n_expert_used  = hparams.n_expert_used();  GGML_UNUSED(n_expert_used); \
+    const int64_t n_expert_used  = hparams.n_expert_used;    GGML_UNUSED(n_expert_used); \
     const int64_t n_ctx_train    = hparams.n_ctx_train;      GGML_UNUSED(n_ctx_train);
 
 // For internal test use

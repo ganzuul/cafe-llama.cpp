@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q3_PLE  = 43,
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -589,6 +590,14 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_MOE_BRANCH_IDS,
+
+        // gather expert weights from a tensor using expert indices
+        // as  -> [ne0, ne1, n_expert]     (expert weights)
+        // ids -> [n_expert_used, n_tokens] (i32, expert indices)
+        // out -> [ne0*ne1, n_expert_used, n_tokens]
+        GGML_OP_MOE_EXPERT_GATHER,
 
         GGML_OP_COUNT,
     };
@@ -1453,6 +1462,36 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
+    // marks the experts of `as` from `first` onwards as mask slots. they must hold zeros, so a
+    // backend that computes them produces zeros, and the CPU backend skips them instead.
+    // there must be one slot per expert rank: a token may not use the same expert twice.
+    // used to split one expert set across backends. first < 0 disables it, which is the default.
+    // maps router ids to the local numbering of one expert branch:
+    // an id in [lo, hi) becomes id - lo, any other id becomes mask_base + its rank.
+    // the mask slots must hold zeros, see ggml_mul_mat_id_set_mask_from.
+    GGML_API struct ggml_tensor * ggml_moe_branch_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            int32_t               lo,
+            int32_t               hi,
+            int32_t               mask_base);
+
+    GGML_API void ggml_mul_mat_id_set_mask_from(
+            struct ggml_tensor  * a,
+            int32_t               first);
+
+    // gather expert weights from a tensor using expert indices
+    // as  -> [ne0, ne1, n_expert]     (expert weights)
+    // ids -> [n_expert_used, n_tokens] (i32, expert indices)
+    // out -> [ne0*ne1, n_expert_used, n_tokens]
+    //
+    // For each token t and expert index e in ids:
+    //   out[:, e, t] = as[:, :, ids[e, t]]  (row from expert tensor)
+    GGML_API struct ggml_tensor * ggml_moe_expert_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
             struct ggml_tensor  * ids);
 
     // A: m columns, n rows,

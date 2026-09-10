@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -37,6 +39,10 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static constexpr uint32_t SERVER_SLOT_DRAFT_MAGIC        = 0x54464453U; // "SDFT"
+static constexpr uint32_t SERVER_SLOT_DRAFT_VERSION      = 1;
+static constexpr size_t   SERVER_SLOT_DRAFT_HEADER_WORDS = 4;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -2555,6 +2561,45 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                    const std::string draft_filepath = filepath + ".dft";
+                    if (ctx_dft) {
+                        std::vector<uint8_t> data_spec;
+                        common_speculative_get_state(slot->spec, slot->id, data_spec);
+
+                        if (packed.size() > UINT32_MAX || data_spec.size() > UINT32_MAX) {
+                            send_error(task, "Slot draft state payload is too large", ERROR_TYPE_SERVER);
+                            break;
+                        }
+
+                        const size_t header_size = SERVER_SLOT_DRAFT_HEADER_WORDS * sizeof(uint32_t);
+                        const size_t payload_size = header_size + packed.size() + data_spec.size();
+                        if (payload_size % sizeof(llama_token) != 0) {
+                            send_error(task, "Slot draft state payload is not token-aligned", ERROR_TYPE_SERVER);
+                            break;
+                        }
+
+                        llama_tokens packed_dft(payload_size / sizeof(llama_token), 0);
+                        auto * payload = reinterpret_cast<uint8_t *>(packed_dft.data());
+                        const uint32_t prompt_size = (uint32_t) packed.size();
+                        const uint32_t spec_size   = (uint32_t) data_spec.size();
+
+                        std::memcpy(payload + 0 * sizeof(uint32_t), &SERVER_SLOT_DRAFT_MAGIC,   sizeof(uint32_t));
+                        std::memcpy(payload + 1 * sizeof(uint32_t), &SERVER_SLOT_DRAFT_VERSION, sizeof(uint32_t));
+                        std::memcpy(payload + 2 * sizeof(uint32_t), &prompt_size, sizeof(uint32_t));
+                        std::memcpy(payload + 3 * sizeof(uint32_t), &spec_size,   sizeof(uint32_t));
+                        std::memcpy(payload + header_size, packed.data(), packed.size());
+                        if (!data_spec.empty()) {
+                            std::memcpy(payload + header_size + packed.size(), data_spec.data(), data_spec.size());
+                        }
+
+                        const size_t nwrite_dft = llama_state_seq_save_file(
+                            ctx_dft, draft_filepath.c_str(), slot->id,
+                            packed_dft.data(), packed_dft.size());
+                        if (nwrite_dft == 0) {
+                            send_error(task, "Unable to save slot draft state", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
                     const size_t nwrite = llama_state_seq_save_file(
                         ctx_tgt, filepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
@@ -2595,6 +2640,7 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+                    const std::string draft_filepath = filepath + ".dft";
 
                     size_t nread = 0;
                     try {
@@ -2609,6 +2655,64 @@ private:
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
                         }
                         packed.resize(n_packed);
+
+                        if (ctx_dft) {
+                            size_t n_packed_dft = 0;
+                            llama_tokens packed_dft;
+                            size_t nread_dft = llama_state_seq_load_file(ctx_dft, draft_filepath.c_str(), slot->id, nullptr, 0, &n_packed_dft);
+                            if (nread_dft != 0) {
+                                packed_dft.resize(std::max<size_t>(1, n_packed_dft));
+                                nread_dft = llama_state_seq_load_file(ctx_dft, draft_filepath.c_str(), slot->id, packed_dft.data(), packed_dft.size(), &n_packed_dft);
+                            }
+                            if (nread_dft == 0) {
+                                throw std::runtime_error("No available draft state for slot save file");
+                            }
+                            packed_dft.resize(n_packed_dft);
+
+                            const size_t header_size = SERVER_SLOT_DRAFT_HEADER_WORDS * sizeof(uint32_t);
+                            const size_t payload_size = packed_dft.size() * sizeof(llama_token);
+                            const size_t prompt_bytes = packed.size() * sizeof(llama_token);
+                            if (payload_size < header_size) {
+                                throw std::runtime_error("Invalid slot draft state payload");
+                            }
+
+                            const auto * payload = reinterpret_cast<const uint8_t *>(packed_dft.data());
+                            uint32_t magic = 0;
+                            uint32_t version = 0;
+                            uint32_t prompt_size = 0;
+                            uint32_t spec_size = 0;
+                            std::memcpy(&magic,       payload + 0 * sizeof(uint32_t), sizeof(uint32_t));
+                            std::memcpy(&version,     payload + 1 * sizeof(uint32_t), sizeof(uint32_t));
+                            std::memcpy(&prompt_size, payload + 2 * sizeof(uint32_t), sizeof(uint32_t));
+                            std::memcpy(&spec_size,   payload + 3 * sizeof(uint32_t), sizeof(uint32_t));
+
+                            if (magic != SERVER_SLOT_DRAFT_MAGIC || version != SERVER_SLOT_DRAFT_VERSION ||
+                                    prompt_size != prompt_bytes ||
+                                    (size_t) prompt_size > payload_size - header_size ||
+                                    (size_t) spec_size != payload_size - header_size - (size_t) prompt_size) {
+                                throw std::runtime_error("Invalid slot draft state envelope");
+                            }
+                            if (std::memcmp(payload + header_size, packed.data(), prompt_bytes) != 0) {
+                                throw std::runtime_error("Target and draft slot save files have mismatched tokens");
+                            }
+
+                            std::vector<uint8_t> data_spec(spec_size);
+                            if (spec_size > 0) {
+                                std::memcpy(data_spec.data(), payload + header_size + prompt_size, spec_size);
+                                common_speculative_set_state(slot->spec, slot->id, data_spec);
+
+                                std::vector<uint8_t> data_spec_check;
+                                if (!common_speculative_get_state(slot->spec, slot->id, data_spec_check) ||
+                                        data_spec_check != data_spec) {
+                                    throw std::runtime_error("Unable to restore slot speculative state");
+                                }
+                            } else {
+                                std::vector<uint8_t> data_spec_check;
+                                if (common_speculative_get_state(slot->spec, slot->id, data_spec_check)) {
+                                    throw std::runtime_error("Slot save file is missing required speculative state");
+                                }
+                            }
+                        }
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
 
@@ -3201,6 +3305,25 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // reusing a partial prefix requires removing the cached tail from every
+                                // attached context. a draft context that cannot partially remove its tail
+                                // would either abort or be cleared entirely, and the speculative driver
+                                // only mirrors new target batches into it, so a cleared draft never sees
+                                // the prompt again and drafts garbage. follow the weakest link: with such
+                                // a draft attached, reuse the whole cached prompt or nothing.
+                                if (ctx_dft && n_past > 0 && (size_t) n_past < slot.prompt.tokens.size()) {
+                                    const uint32_t trim = (uint32_t) (slot.prompt.tokens.size() - n_past);
+
+                                    const bool dft_can_trim =
+                                        ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                                        (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && trim <= llama_n_rs_seq(ctx_dft));
+
+                                    if (!dft_can_trim) {
+                                        SLT_INF(slot, "draft context cannot follow a partial prompt trim of %u tokens - dropping the prompt cache (n_past %d -> 0)\n", trim, n_past);
+                                        n_past = 0;
+                                    }
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3911,9 +4034,19 @@ private:
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
 
+                // the draft context may be unable to roll back even when the target can (e.g. a
+                // recurrent draft model without a rollback ring behind a ring-capable target).
+                // without restoring its checkpoint here, the draft is left permanently desynced
+                // after the first rejection (or aborted on the seq_rm below), so route such
+                // pairs through the checkpoint+replay path; the target itself still rolls back
+                // via its ring in the seq_rm, avoiding the expensive target state restore.
+                const bool use_ckpt_dft = slot.ctx_dft != nullptr &&
+                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                     (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(slot.ctx_dft)));
+
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
-                    if (use_ckpt_tgt) {
+                    if (use_ckpt_tgt || use_ckpt_dft) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
@@ -3926,9 +4059,11 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (use_ckpt_tgt) {
+                            ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
 
-                        if (slot.ctx_dft) {
+                        if (slot.ctx_dft && !ckpt.data_dft.empty()) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 

@@ -439,6 +439,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
     }
 
+    // Q3_PLE is a lookup-only storage type. It intentionally has no vector-dot
+    // implementation and must not be accepted by generic quantized operators.
+    if (src0 != nullptr && src0->type == GGML_TYPE_Q3_PLE && op->op != GGML_OP_GET_ROWS) {
+        return false;
+    }
+
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:

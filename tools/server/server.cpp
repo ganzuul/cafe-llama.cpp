@@ -8,6 +8,7 @@
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
+#include "common/expert-trace.h"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -114,6 +115,17 @@ int llama_server(int argc, char ** argv) {
 
 int llama_server(common_params & params, int argc, char ** argv) {
     bool is_run_by_cli = (argv == nullptr);
+
+    // expert-prefetch study: install the router trace callback for the lifetime
+    // of the server. note: the draft model (-md) shares params.cb_eval; run
+    // trace collections without a draft model for clean main-model traces.
+    static common_expert_trace_user_data * expert_trace_data = nullptr;
+    if (!params.expert_trace_router.empty()) {
+        expert_trace_data = new common_expert_trace_user_data(params.expert_trace_router);
+        params.cb_eval           = common_expert_trace_cb_eval;
+        params.cb_eval_user_data = expert_trace_data;
+        LOG_INF("%s: expert router trace -> %s\n", __func__, params.expert_trace_router.c_str());
+    }
 
     common_models_handler models_handler;
 

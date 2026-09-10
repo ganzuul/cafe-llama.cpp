@@ -869,6 +869,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_iq4_nl,
         .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_nl_ref,
     },
+    [GGML_TYPE_Q3_PLE] = {
+        .type_name                = "q3_ple",
+        .blck_size                = QK3_PLE,
+        .type_size                = sizeof(block_q3_ple),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q3_ple,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q3_ple_ref,
+    },
     [GGML_TYPE_IQ4_XS] = {
         .type_name                = "iq4_xs",
         .blck_size                = QK_K,
@@ -1099,9 +1107,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_BRANCH_IDS",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1224,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_branch_ids(x)",
+    "moe_expert_gather(as, ids)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3314,6 +3327,38 @@ void ggml_mul_mat_set_prec(
     ggml_set_op_params_i32(a, 0, prec_i32);
 }
 
+struct ggml_tensor * ggml_moe_branch_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        int32_t               lo,
+        int32_t               hi,
+        int32_t               mask_base) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(lo >= 0 && hi > lo);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+
+    int32_t params[] = { lo, hi, mask_base };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_BRANCH_IDS;
+    result->src[0] = ids;
+
+    return result;
+}
+
+void ggml_mul_mat_id_set_mask_from(
+        struct ggml_tensor * a,
+        int32_t              first) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(first < a->src[0]->ne[2]);
+    // one mask slot per expert rank
+    GGML_ASSERT(first < 0 || a->src[0]->ne[2] - first >= a->src[2]->ne[0]);
+
+    // stored with a bias so that the default of 0 means no mask slots
+    ggml_set_op_params_i32(a, 0, first < 0 ? 0 : first + 1);
+}
+
 void ggml_mul_mat_set_hint(
         struct ggml_tensor * a,
         enum ggml_op_hint    hint) {
@@ -3360,6 +3405,47 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_moe_expert_gather
+//
+// C = ggml_moe_expert_gather(ctx, as, ids)
+//
+// as  -> [ne0, ne1, n_expert]     (expert weights)
+// ids -> [n_expert_used, n_tokens] (i32, expert indices)
+// out -> [ne0*ne1, n_expert_used, n_tokens]
+//
+// For each token t and expert index e in ids:
+//   out[:, e, t] = as[:, :, ids[e, t]]  (row from expert tensor)
+struct ggml_tensor * ggml_moe_expert_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+
+    // Flatten the first two dimensions of as
+    // This handles all MoE path layouts uniformly:
+    //   gate_up: ne0 = n_ff*2, ne1 = n_embd -> flattened = n_ff*2*n_embd
+    //   up:      ne0 = n_ff, ne1 = n_embd   -> flattened = n_ff*n_embd
+    //   gate:    ne0 = n_ff, ne1 = n_embd   -> flattened = n_ff*n_embd
+    //   down:    ne0 = n_embd, ne1 = n_ff   -> flattened = n_embd*n_ff
+    const int64_t ne01 = as->ne[0] * as->ne[1];
+
+    const int64_t ne[4] = {
+        ne01,               // flattened expert dimension
+        ids->ne[0],         // n_expert_used
+        ids->ne[1],         // n_tokens
+        1
+    };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MOE_EXPERT_GATHER;
+    result->src[0] = as;
+    result->src[1] = ids;
 
     return result;
 }
@@ -8002,6 +8088,7 @@ size_t ggml_quantize_chunk(
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q3_PLE:  result = quantize_q3_ple (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
