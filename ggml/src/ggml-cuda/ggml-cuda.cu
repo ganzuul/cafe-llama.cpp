@@ -5204,6 +5204,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             break;
         case GGML_OP_MOE_BRANCH_IDS:
             return op->src[0]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
+        case GGML_OP_MOE_EXPERT_GATHER:
+            // Runs on CPU; CUDA dispatch returns true to allow host tensor access
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:

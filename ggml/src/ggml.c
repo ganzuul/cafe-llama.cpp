@@ -1110,7 +1110,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MOE_BRANCH_IDS",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1225,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "moe_branch_ids(x)",
+    "moe_expert_gather(as, ids)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3392,6 +3393,47 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_moe_expert_gather
+//
+// C = ggml_moe_expert_gather(ctx, as, ids)
+//
+// as  -> [ne0, ne1, n_expert]     (expert weights)
+// ids -> [n_expert_used, n_tokens] (i32, expert indices)
+// out -> [ne0*ne1, n_expert_used, n_tokens]
+//
+// For each token t and expert index e in ids:
+//   out[:, e, t] = as[:, :, ids[e, t]]  (row from expert tensor)
+struct ggml_tensor * ggml_moe_expert_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+
+    // Flatten the first two dimensions of as
+    // This handles all MoE path layouts uniformly:
+    //   gate_up: ne0 = n_ff*2, ne1 = n_embd -> flattened = n_ff*2*n_embd
+    //   up:      ne0 = n_ff, ne1 = n_embd   -> flattened = n_ff*n_embd
+    //   gate:    ne0 = n_ff, ne1 = n_embd   -> flattened = n_ff*n_embd
+    //   down:    ne0 = n_embd, ne1 = n_ff   -> flattened = n_embd*n_ff
+    const int64_t ne01 = as->ne[0] * as->ne[1];
+
+    const int64_t ne[4] = {
+        ne01,               // flattened expert dimension
+        ids->ne[0],         // n_expert_used
+        ids->ne[1],         // n_tokens
+        1
+    };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MOE_EXPERT_GATHER;
+    result->src[0] = as;
+    result->src[1] = ids;
 
     return result;
 }

@@ -593,6 +593,12 @@ extern "C" {
 
         GGML_OP_MOE_BRANCH_IDS,
 
+        // gather expert weights from a tensor using expert indices
+        // as  -> [ne0, ne1, n_expert]     (expert weights)
+        // ids -> [n_expert_used, n_tokens] (i32, expert indices)
+        // out -> [ne0*ne1, n_expert_used, n_tokens]
+        GGML_OP_MOE_EXPERT_GATHER,
+
         GGML_OP_COUNT,
     };
 
@@ -1468,6 +1474,18 @@ extern "C" {
     GGML_API void ggml_mul_mat_id_set_mask_from(
             struct ggml_tensor  * a,
             int32_t               first);
+
+    // gather expert weights from a tensor using expert indices
+    // as  -> [ne0, ne1, n_expert]     (expert weights)
+    // ids -> [n_expert_used, n_tokens] (i32, expert indices)
+    // out -> [ne0*ne1, n_expert_used, n_tokens]
+    //
+    // For each token t and expert index e in ids:
+    //   out[:, e, t] = as[:, :, ids[e, t]]  (row from expert tensor)
+    GGML_API struct ggml_tensor * ggml_moe_expert_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * ids);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

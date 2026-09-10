@@ -12045,3 +12045,53 @@ void ggml_compute_forward_moe_branch_ids(const ggml_compute_params * params, ggm
         }
     }
 }
+
+// ggml_compute_forward_moe_expert_gather
+//
+// For each token t and expert index e in ids:
+//   out[:, e, t] = as[:, :, ids[e, t]]  (row from expert tensor)
+void ggml_compute_forward_moe_expert_gather(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * as  = dst->src[0];
+    const ggml_tensor * ids = dst->src[1];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+
+    const int64_t ne01 = dst->ne[0]; // flattened expert dimension (ne0 * ne1 of as)
+    const int64_t ne1  = dst->ne[1]; // n_expert_used
+    const int64_t ne2  = dst->ne[2]; // n_tokens
+    const int64_t n_expert = as->ne[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Each thread handles a subset of expert tokens (ne1 * ne2)
+    const int64_t total_expert_tokens = ne1 * ne2;
+    const int64_t tokens_per_thread = (total_expert_tokens + nth - 1) / nth;
+    const int64_t token_start = ith * tokens_per_thread;
+    const int64_t token_end   = MIN(token_start + tokens_per_thread, total_expert_tokens);
+
+    for (int64_t token_idx = token_start; token_idx < token_end; token_idx++) {
+        const int64_t e = token_idx / ne2;  // expert index in output
+        const int64_t t = token_idx % ne2;  // token index
+
+        // Read expert id from ids tensor
+        const int32_t expert_id = *(const int32_t *) ((const char *) ids->data + e * ids->nb[0] + t * ids->nb[1]);
+
+        // Pointer to output row
+        float * dst_row = (float *) ((char *) dst->data + e * dst->nb[1] + t * dst->nb[2]);
+
+        // Validate expert ID — zero-fill on invalid
+        if (expert_id < 0 || expert_id >= (int32_t) n_expert) {
+            memset(dst_row, 0, ne01 * sizeof(float));
+            continue;
+        }
+
+        // Copy expert weights from source tensor
+        // Expert e's weights are at as->data + expert_id * as->nb[2]
+        const float * src_expert = (const float *) ((const char *) as->data + expert_id * as->nb[2]);
+        memcpy(dst_row, src_expert, ne01 * sizeof(float));
+    }
+}

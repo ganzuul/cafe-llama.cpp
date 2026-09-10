@@ -1747,6 +1747,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_moe_branch_ids(params, tensor);
             } break;
+        case GGML_OP_MOE_EXPERT_GATHER:
+            {
+                ggml_compute_forward_moe_expert_gather(params, tensor);
+            } break;
         case GGML_OP_ADD1:
             {
                 ggml_compute_forward_add1(params, tensor);
@@ -2247,6 +2251,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
         case GGML_OP_MOE_BRANCH_IDS:
+        case GGML_OP_MOE_EXPERT_GATHER:
         case GGML_OP_ADD1:
         case GGML_OP_ACC:
         case GGML_OP_CUMSUM:
@@ -2891,6 +2896,12 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                    } break;
+                case GGML_OP_MOE_EXPERT_GATHER:
+                    {
+                        // Output tensor (F32) + ids tensor (I32)
+                        cur += ggml_type_size(GGML_TYPE_F32) * node->ne[0] * node->ne[1] * node->ne[2] * n_tasks;
+                        cur += ggml_type_size(GGML_TYPE_I32) * node->src[1]->ne[0] * node->src[1]->ne[1];
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

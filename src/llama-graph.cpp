@@ -1545,6 +1545,41 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
               int32_t   mask_from) const {
+    // [MVP] When mask_from >= 0, this is a MoE expert branch.
+    // Use CPU-side expert gather + standard matmul instead of
+    // ggml_mul_mat_id (which has sync-heavy CUDA dispatch).
+    if (mask_from >= 0) {
+        // CPU-side expert gather: gather expert weights using ids
+        // Output shape: [ne0*ne1, n_expert_used, n_tokens, 1]
+        ggml_tensor * gathered = ggml_moe_expert_gather(ctx0, w, ids);
+
+        // Reshape gathered from [ne0*ne1, n_exp, n_tok, 1] to [ne0, ne1, n_exp*n_tok, 1]
+        // so that matmul can handle all experts and tokens in one call.
+        const int64_t n_exp = gathered->ne[1];  // n_expert_used
+        const int64_t n_tok = gathered->ne[2];  // n_tokens
+        ggml_tensor * a = ggml_reshape_4d(ctx0, gathered, w->ne[0], w->ne[1], n_exp * n_tok, 1);
+
+        // Repeat cur [ne1, n_tok] to [ne1, n_exp, n_tok, 1] so each expert gets the same input.
+        ggml_tensor * b_shape = ggml_new_tensor_4d(ctx0, cur->type, cur->ne[0], n_exp, n_tok, 1);
+        ggml_tensor * b = ggml_repeat(ctx0, cur, b_shape);
+
+        // Matmul: [ne0, ne1, n_exp*n_tok, 1] @ [ne1, n_exp, n_tok, 1]
+        // => [ne0, n_exp, n_tok, 1]
+        ggml_tensor * res = ggml_mul_mat(ctx0, a, b);
+
+        if (w_s) {
+            const int64_t n_expert = w_s->ne[0];
+            const int64_t n_tokens = cur->ne[2];
+            ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+            s = ggml_get_rows(ctx0, s, ids);
+            res = ggml_mul(ctx0, res, s);
+        }
+        // LoRA deferred — not supported in MVP
+        return res;
+    }
+
+    // Non-MoE path — use original ggml_mul_mat_id
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (mask_from >= 0) {
