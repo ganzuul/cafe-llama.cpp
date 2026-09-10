@@ -1906,6 +1906,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // [MVP] Performance hook: measure CUDA mul_mat_id time
+    static std::atomic<int64_t> total_cuda_mm_us{0};
+    int64_t cuda_start_us = ggml_time_us();
+
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2075,6 +2079,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+
+    // [MVP] Performance hook: log CUDA mul_mat_id time
+    int64_t cuda_end_us = ggml_time_us();
+    int64_t cuda_us = cuda_end_us - cuda_start_us;
+    total_cuda_mm_us += cuda_us;
+    GGML_LOG_DEBUG("mul_mat_id: ne0=%lld ne1=%lld ne2=%lld cuda_us=%lld total_cuda_us=%lld",
+            (long long)ne0, (long long)ne1, (long long)ne2, (long long)cuda_us, total_cuda_mm_us.load());
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {

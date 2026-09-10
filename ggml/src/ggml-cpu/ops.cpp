@@ -12051,6 +12051,9 @@ void ggml_compute_forward_moe_branch_ids(const ggml_compute_params * params, ggm
 // For each token t and expert index e in ids:
 //   out[:, e, t] = as[:, :, ids[e, t]]  (row from expert tensor)
 void ggml_compute_forward_moe_expert_gather(const ggml_compute_params * params, ggml_tensor * dst) {
+    // [MVP] Performance hook: measure CPU gather time
+    int64_t gather_start_us = ggml_time_us();
+
     const ggml_tensor * as  = dst->src[0];
     const ggml_tensor * ids = dst->src[1];
 
@@ -12094,4 +12097,10 @@ void ggml_compute_forward_moe_expert_gather(const ggml_compute_params * params, 
         const float * src_expert = (const float *) ((const char *) as->data + expert_id * as->nb[2]);
         memcpy(dst_row, src_expert, ne01 * sizeof(float));
     }
+
+    // [MVP] Performance hook: log gather time
+    int64_t gather_end_us = ggml_time_us();
+    int64_t gather_us = gather_end_us - gather_start_us;
+    GGML_LOG_DEBUG("moe_expert_gather: ne01=%lld ne1=%lld ne2=%lld time=%lld us (%.2f ms)",
+            (long long)ne01, (long long)ne1, (long long)ne2, (long long)gather_us, gather_us / 1000.0);
 }
