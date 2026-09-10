@@ -3108,6 +3108,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.cb_data    =*/ NULL,  // [Gap 3] Optional callback for MOE gather completion signaling
     };
 
 #ifdef GGML_USE_OPENMP

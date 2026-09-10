@@ -12054,6 +12054,18 @@ void ggml_compute_forward_moe_expert_gather(const ggml_compute_params * params, 
     // [MVP] Performance hook: measure CPU gather time
     int64_t gather_start_us = ggml_time_us();
 
+    // [Gap 3] Callback pointer for signaling GPU-side event recording.
+    // Thread 0 invokes this after gather completes to record the CUDA event.
+    // Read from params->cb_data (set by CUDA dispatch) or dst->extra (set by graph construction).
+    void (*gather_complete_cb)(void *) = NULL;
+    void * gather_cb_ctx = params->cb_data;
+    if (!gather_cb_ctx) {
+        gather_cb_ctx = dst->extra;  // fallback: tensor extra field set by graph construction
+    }
+    if (gather_cb_ctx) {
+        gather_complete_cb = (void (*)(void *))gather_cb_ctx;
+    }
+
     const ggml_tensor * as  = dst->src[0];
     const ggml_tensor * ids = dst->src[1];
 
@@ -12103,4 +12115,11 @@ void ggml_compute_forward_moe_expert_gather(const ggml_compute_params * params, 
     int64_t gather_us = gather_end_us - gather_start_us;
     GGML_LOG_DEBUG("moe_expert_gather: ne01=%lld ne1=%lld ne2=%lld time=%lld us (%.2f ms)",
             (long long)ne01, (long long)ne1, (long long)ne2, (long long)gather_us, gather_us / 1000.0);
+
+    // [Gap 3] Signal completion to GPU: thread 0 invokes callback to record CUDA event.
+    // This enables the GPU matmul for the next layer to wait on gather completion
+    // instead of waiting on the previous matmul (enabling double-buffering).
+    if (ith == 0 && gather_complete_cb) {
+        gather_complete_cb(params->cb_data);
+    }
 }

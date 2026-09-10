@@ -1905,6 +1905,21 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// [Gap 3] Callback invoked by CPU gather thread 0 after completion.
+// Records the gather-done event on the gather stream so the GPU matmul
+// for the next layer can wait on it (enabling double-buffering).
+// user_data points to a struct { cudaStream_t gather_stream; cudaEvent_t gather_done_event; }
+struct ggml_cuda_gather_cb_ctx {
+    cudaStream_t  gather_stream;
+    cudaEvent_t   gather_done_event;
+};
+static void ggml_cuda_moe_gather_complete_cb(void * user_data) {
+    auto * cb = (ggml_cuda_gather_cb_ctx *)user_data;
+    if (cb->gather_done_event && cb->gather_stream) {
+        CUDA_CHECK(cudaEventRecord(cb->gather_done_event, cb->gather_stream));
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // [MVP] Performance hook: measure CUDA mul_mat_id time
     static std::atomic<int64_t> total_cuda_mm_us{0};
@@ -2015,6 +2030,30 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
+
+    // [Gap 3] CUDA stream overlap: main stream waits for gather completion event.
+    // cudaStreamWaitEvent is GPU-side non-blocking — the CPU thread continues
+    // while the GPU stream stalls until the gather event fires.
+    // Without a gather callback (pre-Gap-3-full), this falls back to synchronize()
+    // which blocks the CPU but is safe since gather already completed on thread pool.
+    if (ctx.moe_gather_stream.gather_done_event) {
+        if (ctx.moe_gather_stream.gather_stream) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.moe_gather_stream.gather_done_event, 0));
+        } else {
+            // Fallback: gather stream not initialized — block CPU until event fires.
+            // Safe because gather ran on CPU thread pool before this dispatch.
+            CUDA_CHECK(cudaEventSynchronize(ctx.moe_gather_stream.gather_done_event));
+        }
+    }
+
+    // [Gap 3] Record gather-done event now that CPU gather has completed.
+    // This event will be waited on by the NEXT layer's matmul (double-buffering).
+    // The event is recorded on the gather stream so that the main stream's
+    // cudaStreamWaitEvent properly synchronizes.
+    if (ctx.moe_gather_stream.gather_done_event && ctx.moe_gather_stream.gather_stream) {
+        CUDA_CHECK(cudaEventRecord(ctx.moe_gather_stream.gather_done_event, ctx.moe_gather_stream.gather_stream));
+    }
+
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;

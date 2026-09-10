@@ -1411,6 +1411,52 @@ struct ggml_cuda_stream_context {
         concurrent_events.clear();
     }
 };
+
+// [Gap 3] MOE gather stream context for CUDA stream overlap.
+// Manages a dedicated non-blocking stream for CPU-side expert gather
+// and a CUDA event for synchronization with GPU matmul.
+//
+// Double-buffering pattern (from PR #25294):
+//   Layer N:   GPU computes matmul on main stream
+//   Layer N:   CPU prefetches layer N+1's experts on gather stream (async)
+//   Layer N:   CPU gather completes, records event on gather stream
+//   Layer N+1: GPU matmul waits on gather event, then runs on main stream
+//
+// This hides PCIe/CPU latency behind GPU compute, achieving ~6.3 tok/s
+// projected vs 4.7 tok/s without double-buffering.
+struct ggml_moe_gather_stream_ctx {
+    cudaStream_t gather_stream = nullptr;  // dedicated stream for CPU gather
+    cudaEvent_t  gather_done_event = nullptr;  // records when gather completes
+    int device = -1;
+
+    void init(int dev) {
+        if (device >= 0) return;  // already initialized
+        device = dev;
+        ggml_cuda_set_device(device);
+
+        // Create a non-blocking stream for CPU gather
+        CUDA_CHECK(cudaStreamCreateWithFlags(&gather_stream, cudaStreamNonBlocking));
+
+        // Create an event for gather completion synchronization
+        CUDA_CHECK(cudaEventCreateWithFlags(&gather_done_event, cudaEventDefault));
+    }
+
+    void destroy() {
+        if (gather_stream) {
+            CUDA_CHECK(cudaStreamDestroy(gather_stream));
+            gather_stream = nullptr;
+        }
+        if (gather_done_event) {
+            CUDA_CHECK(cudaEventDestroy(gather_done_event));
+            gather_done_event = nullptr;
+        }
+        device = -1;
+    }
+
+    ~ggml_moe_gather_stream_ctx() {
+        destroy();
+    }
+};
 struct ggml_cuda_expert_lru_cache {
     struct entry {
         void * dev_ptr = nullptr;
@@ -1729,12 +1775,16 @@ struct ggml_backend_cuda_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
         expert_cache.init(device);
         staging_mgr.init(device);
+        moe_gather_stream.init(device);
     }
 
     ggml_cuda_expert_lru_cache expert_cache;
 
     // [MVP] Staging buffer manager for hot/cold expert routing
     ggml_moe_staging_manager staging_mgr;
+
+    // [Gap 3] MOE gather stream context for CUDA stream overlap
+    ggml_moe_gather_stream_ctx moe_gather_stream;
 
     ggml_cuda_stream_context concurrent_stream_context;
 
