@@ -1109,9 +1109,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MOE_BRANCH_IDS",
+    "STAGE_EXPERTS",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1227,9 +1228,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "moe_branch_ids(x)",
     "moe_expert_gather(as, ids)",
+    "stage_experts(as, ids)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3448,6 +3450,60 @@ struct ggml_tensor * ggml_moe_expert_gather(
     result->src[1] = ids;
 
     return result;
+}
+
+//
+// C = ggml_stage_experts(ctx, as, ids, ids_sorted)
+//
+// as         -> [ne0, ne1, n_expert]          (expert weights, any quant type)
+// ids        -> [n_expert_used, n_tokens]     (i32, indices into as->ne[2])
+// ids_sorted -> [n_expert_used, n_tokens]     (i32, output: sorted distinct union)
+// out        -> [ne0, ne1, n_max_union]       (same type as as)
+//
+// The union of distinct in-range ids is computed on the CPU, sorted ascending,
+// and written to ids_sorted (padded with -1). Expert planes [0, n_union) of the
+// output are then filled from as. Consumers remap their ids through ids_sorted
+// to index the compacted expert dimension.
+//
+// The output is allocated at the maximum possible union size
+// (ids->ne[0]*ids->ne[1]) because the true count is data-dependent and a ggml
+// tensor has a fixed shape. The executor writes the actual count into the
+// op_params slot of the result, readable via ggml_stage_experts_n_union().
+struct ggml_tensor * ggml_stage_experts(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * ids_sorted) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids_sorted->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids_sorted->ne[0] == ids->ne[0] && ids_sorted->ne[1] == ids->ne[1]);
+    GGML_ASSERT(as->ne[3] == 1);          // one matrix per expert
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+
+    const int64_t n_max_union = ids->ne[0] * ids->ne[1];
+
+    const int64_t ne[4] = {
+        as->ne[0],
+        as->ne[1],
+        n_max_union,
+        1,
+    };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, as->type, 4, ne);
+
+    result->op     = GGML_OP_STAGE_EXPERTS;
+    result->src[0] = as;
+    result->src[1] = ids;
+    result->src[2] = ids_sorted;
+
+    ggml_set_op_params_i32(result, 0, 0); // n_union, filled at execution
+
+    return result;
+}
+
+// Number of valid expert planes in a ggml_stage_experts() result.
+int32_t ggml_stage_experts_n_union(const struct ggml_tensor * t) {
+    GGML_ASSERT(t->op == GGML_OP_STAGE_EXPERTS);
+    return ggml_get_op_params_i32(t, 0);
 }
 
 // ggml_out_prod

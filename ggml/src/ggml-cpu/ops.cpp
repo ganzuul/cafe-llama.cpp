@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <vector>
 #include <cfloat>
 #include <cmath>
 
@@ -12264,5 +12265,107 @@ void ggml_compute_forward_moe_expert_gather(const ggml_compute_params * params, 
     // instead of waiting on the previous matmul (enabling double-buffering).
     if (ith == 0 && gather_complete_cb) {
         gather_complete_cb(params->cb_data);
+    }
+}
+
+// ggml_compute_forward_stage_experts
+//
+// Builds the sorted distinct union of expert ids, then copies each selected
+// expert plane from `as` into the compact staging tensor. Type-preserving:
+// rows are copied as raw bytes, so quantized expert weights stay quantized
+// and can be consumed by the standard quantized mul_mat_id kernel.
+//
+//   as         -> [ne0, ne1, n_expert]
+//   ids        -> [n_expert_used, n_tokens]
+//   ids_sorted -> [n_expert_used, n_tokens]  (output, -1 padded)
+//   dst        -> [ne0, ne1, n_max_union]
+void ggml_compute_forward_stage_experts(const ggml_compute_params * params, ggml_tensor * dst) {
+    const int64_t t_start_us = ggml_time_us();
+
+    const ggml_tensor * as         = dst->src[0];
+    const ggml_tensor * ids        = dst->src[1];
+    const ggml_tensor * ids_sorted = dst->src[2];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids_sorted->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == as->type);
+    GGML_ASSERT(dst->ne[0] == as->ne[0] && dst->ne[1] == as->ne[1]);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+
+    const int64_t n_expert   = as->ne[2];
+    const int64_t n_ids      = ids->ne[0] * ids->ne[1];
+    const int64_t n_max_union = dst->ne[2];
+
+    GGML_ASSERT(n_ids <= n_max_union);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Thread 0 computes the sorted distinct union and records n_union.
+    // Every thread then copies a disjoint slice of the union planes.
+    int32_t n_union = 0;
+    if (ith == 0) {
+        // Collect in-range ids. n_ids is small (n_expert_used * n_tokens).
+        std::vector<int32_t> sorted;
+        sorted.reserve(n_ids);
+        for (int64_t i = 0; i < n_ids; ++i) {
+            const int32_t id = *(const int32_t *) ((const char *) ids->data + i * ids->nb[0]);
+            if (id >= 0 && id < (int32_t) n_expert) {
+                sorted.push_back(id);
+            }
+        }
+        std::sort(sorted.begin(), sorted.end());
+        sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+
+        n_union = (int32_t) sorted.size();
+
+        // Write the union into ids_sorted, padding the tail with -1 so callers
+        // can detect unused slots.
+        int32_t * out = (int32_t *) ids_sorted->data;
+        for (int64_t i = 0; i < n_ids; ++i) {
+            out[i] = (i < (int64_t) sorted.size()) ? sorted[i] : -1;
+        }
+
+        ggml_set_op_params_i32(dst, 0, n_union);
+    }
+
+    // Broadcast n_union to all threads. The threadpool barrier is provided by
+    // the executor between the id pass and the compute pass only if requested;
+    // since n_union is read here right after thread 0 writes it, we rely on
+    // the barrier the CPU backend inserts for this op (registered below).
+    ggml_barrier(params->threadpool);
+    n_union = ggml_get_op_params_i32(dst, 0);
+
+    if (n_union <= 0) {
+        return;
+    }
+
+    // Expert rows are copied verbatim: bpr is the byte size of one expert
+    // plane (all ne1 rows of ne0 elements, in the tensor's own type).
+    const size_t plane_bytes = (size_t) as->ne[1] * as->nb[1];
+
+    const int64_t planes_per_thread = (n_union + nth - 1) / nth;
+    const int64_t plane_start = ith * planes_per_thread;
+    const int64_t plane_end   = MIN(plane_start + planes_per_thread, (int64_t) n_union);
+
+    const int32_t * sorted_ids = (const int32_t *) ids_sorted->data;
+
+    for (int64_t k = plane_start; k < plane_end; ++k) {
+        const int32_t expert_id = sorted_ids[k];
+        if (expert_id < 0) {
+            continue;
+        }
+        const char * src = (const char *) as->data + (size_t) expert_id * as->nb[2];
+        char *       d   = (char *) dst->data  + (size_t) k         * dst->nb[2];
+        memcpy(d, src, plane_bytes);
+    }
+
+    if (ith == 0) {
+        GGML_LOG_DEBUG("stage_experts: ne0=%lld ne1=%lld n_expert=%lld n_ids=%lld "
+                       "n_union=%d (%.0f%% dedup) plane_bytes=%zu time=%lld us\n",
+                (long long) as->ne[0], (long long) as->ne[1], (long long) n_expert,
+                (long long) n_ids, n_union,
+                n_ids ? 100.0 * n_union / n_ids : 0.0,
+                plane_bytes, (long long) (ggml_time_us() - t_start_us));
     }
 }

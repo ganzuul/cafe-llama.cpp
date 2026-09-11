@@ -1919,6 +1919,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_moe_expert_gather(params, tensor);
             } break;
+        case GGML_OP_STAGE_EXPERTS:
+            {
+                ggml_compute_forward_stage_experts(params, tensor);
+            } break;
         case GGML_OP_ADD1:
             {
                 ggml_compute_forward_add1(params, tensor);
@@ -2420,6 +2424,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ADD_ID:
         case GGML_OP_MOE_BRANCH_IDS:
         case GGML_OP_MOE_EXPERT_GATHER:
+        case GGML_OP_STAGE_EXPERTS:
         case GGML_OP_ADD1:
         case GGML_OP_ACC:
         case GGML_OP_CUMSUM:
@@ -3080,6 +3085,12 @@ struct ggml_cplan ggml_graph_plan(
                         // Output tensor (F32) + ids tensor (I32)
                         cur += ggml_type_size(GGML_TYPE_F32) * node->ne[0] * node->ne[1] * node->ne[2] * n_tasks;
                         cur += ggml_type_size(GGML_TYPE_I32) * node->src[1]->ne[0] * node->src[1]->ne[1];
+                    } break;
+                case GGML_OP_STAGE_EXPERTS:
+                    {
+                        // No per-thread scratch: the union is computed in a
+                        // small thread-0-local std::vector and the id list is
+                        // written into the caller-provided ids_sorted tensor.
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

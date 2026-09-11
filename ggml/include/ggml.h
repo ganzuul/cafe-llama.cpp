@@ -599,6 +599,21 @@ extern "C" {
         // out -> [ne0*ne1, n_expert_used, n_tokens]
         GGML_OP_MOE_EXPERT_GATHER,
 
+        // Stage the union of routed experts into a compact, contiguous tensor.
+        // Unlike MOE_EXPERT_GATHER (F32-only, debug gather), this preserves the
+        // source quant type so the standard quantized mul_mat_id kernel can
+        // consume the staged copy directly.
+        //
+        //   src0 = expert weights [ne0, ne1, n_expert]  (any quant type)
+        //   src1 = ids [n_expert_used, n_tokens]        (i32, indices into src0->ne[2])
+        //   out  = [ne0, ne1, n_union]                  (same type as src0)
+        //
+        // where n_union is the number of DISTINCT non-negative ids (deduped,
+        // sorted ascending). ids_sorted holds that union, so callers remap
+        // their ids through it before calling mul_mat_id. Only src1->ne[1]
+        // tokens are staged (batch dim), not the full descriptor.
+        GGML_OP_STAGE_EXPERTS,
+
         GGML_OP_COUNT,
     };
 
@@ -1493,6 +1508,29 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * ids);
+
+    // Stage the union of routed experts into a compact contiguous tensor,
+    // preserving as->type so a quantized mul_mat_id can consume it.
+    //
+    // Returns the staged tensor [ne0, ne1, n_union]. The distinct sorted id
+    // union is written to ids_sorted, which must have at least
+    // ids->ne[0]*ids->ne[1] int32 elements. Callers map their original ids
+    // through ids_sorted to obtain ids into the [.., n_union] dimension.
+    //
+    // n_union is returned via *out_n_union. The staged tensor is allocated
+    // with the maximum possible n_union (ids->ne[0]*ids->ne[1]) and the
+    // consumer should treat only the first *out_n_union expert planes as
+    // valid; use ggml_stage_experts_n_union() to read the actual count at
+    // execution time.
+    GGML_API struct ggml_tensor * ggml_stage_experts(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * ids_sorted);
+
+    // Number of valid expert planes in a ggml_stage_experts() result.
+    // Valid only after the graph containing the op has executed.
+    GGML_API int32_t ggml_stage_experts_n_union(const struct ggml_tensor * t);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

@@ -5317,6 +5317,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MOE_EXPERT_GATHER:
             // Runs on CPU; CUDA dispatch returns true to allow host tensor access
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_STAGE_EXPERTS:
+            // Runs on CPU (type-preserving row gather from host-resident expert
+            // weights). Returning true lets the scheduler place this node where
+            // the host-mapped expert tensor lives while still allowing GPU
+            // consumers of the staged result.
+            return op->src[1]->type == GGML_TYPE_I32 &&
+                   op->src[2]->type == GGML_TYPE_I32 &&
+                   op->type == op->src[0]->type &&
+                   op->src[2]->ne[0] == op->src[1]->ne[0] &&
+                   op->src[2]->ne[1] == op->src[1]->ne[1];
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
