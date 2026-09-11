@@ -1935,7 +1935,7 @@ static void ggml_cuda_moe_trace(const ggml_tensor * dst, int64_t wall_us,
         if (file != nullptr) {
             std::fclose(file);
         }
-        file = std::fopen(path, "a");
+        file = std::fopen(path, "ab");
         opened_path = path;
     }
     if (file == nullptr) {
