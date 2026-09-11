@@ -1546,6 +1546,19 @@ static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
+    // Opt-in CPU-side MoE trace. The final barrier makes wall_us cover all
+    // worker threads; only thread 0 writes the JSONL record.
+    static _Atomic int64_t trace_start_us = 0;
+    static FILE * trace_file = NULL;
+    const char * trace_path = getenv("LLAMA_MOE_TRACE");
+    const bool trace = trace_path != NULL && trace_path[0] != '\0';
+    if (trace && params->ith == 0) {
+        if (trace_file == NULL) {
+            trace_file = fopen(trace_path, "ab");
+        }
+        atomic_store_explicit(&trace_start_us, ggml_time_us(), memory_order_relaxed);
+    }
+
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
@@ -1576,6 +1589,10 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+    int64_t trace_routes = 0;
+    int64_t trace_masked = 0;
+    int64_t trace_unique = 0;
+    uint8_t * trace_seen = trace && params->ith == 0 ? calloc((size_t) n_as, 1) : NULL;
 
     void * wdata_cur = params->wdata;
 
@@ -1654,8 +1671,19 @@ static void ggml_compute_forward_mul_mat_id(
 
                 if (mask_from >= 0 && i02 >= mask_from) {
                     // mask slots hold zeros, write them without reading the weights
+                    if (trace && params->ith == 0) {
+                        trace_masked++;
+                    }
                     memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
                     continue;
+                }
+
+                if (trace && params->ith == 0) {
+                    trace_routes++;
+                    if (trace_seen != NULL && trace_seen[i02] == 0) {
+                        trace_seen[i02] = 1;
+                        trace_unique++;
+                    }
                 }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
@@ -1737,6 +1765,26 @@ static void ggml_compute_forward_mul_mat_id(
             }
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        }
+    }
+
+    if (trace) {
+        ggml_barrier(params->threadpool);
+        if (params->ith == 0) {
+            const int64_t start_us = atomic_load_explicit(&trace_start_us, memory_order_relaxed);
+            const int64_t wall_us = ggml_time_us() - start_us;
+            if (trace_file != NULL) {
+                fprintf(trace_file,
+                    "{\"backend\":\"cpu\",\"op\":\"mul_mat_id\",\"ne0\":%" PRId64
+                    ",\"ne1\":%" PRId64 ",\"ne2\":%" PRId64
+                    ",\"n_ids\":%d,\"n_expert\":%d,\"routes\":%" PRId64
+                    ",\"masked\":%" PRId64 ",\"unique_experts\":%" PRId64
+                    ",\"wall_us\":%" PRId64 "}\n",
+                    ne0, ne1, ne2, n_ids, n_as, trace_routes, trace_masked,
+                    trace_unique, wall_us);
+                fflush(trace_file);
+            }
+            free(trace_seen);
         }
     }
 }
