@@ -26,8 +26,27 @@
 #
 # Active placement flags:
 #   -ngl 48: measured FTQ recipe for GPU attention/norm/recurrent state.
-#   -ot ...=CPU: keep ranked hot/cold expert tensors CPU/mmap-backed.
+#   -ot '...hot=CPU,...cold=CPU': keep ranked hot/cold expert tensors on the
+#       host (single comma-separated value; repeated -ot is deprecated).
 #   --ngram-ssd: keep the PLE table mmap/SSD-backed when present.
+#
+# NOTE on measurement (2026-09, RTX 2070 SUPER / ~23 GiB RAM):
+#   The one-line -ot form is a cleanup only. It is NOT a performance change.
+#   Verified equivalent to the previous two-flag form: both resolve every
+#   expert tensor to buffer type CUDA_Host (the "=CPU" value routes through
+#   select_weight_buft over buft_list_cpu; it does not mean the plain CPU
+#   buffer). The only observable difference is that the one-line form no
+#   longer emits the DEPRECATED repeated-argument warning.
+#
+#   Separate A/B result that must not be over-read: we CANNOT distinguish
+#   trace-on from trace-off throughput on this host. Observed decode rates:
+#       trace on  (two-flag):  2.36 tok/s
+#       trace on  (one-line):  2.73, 3.88 tok/s
+#       trace off:             3.10, 4.06 tok/s
+#   Run-to-run spread (2.4-4.1 tok/s) exceeds any apparent difference. One
+#   sample per arm is not enough; a defensible overhead number needs >=5
+#   repetitions per arm on a warmed page cache. Do not cite these as a
+#   measurement of LLAMA_MOE_TRACE cost.
 exec /run/media/nos/games/inference_engines/workstreams/llama.cpp-mtp-slot-state/build/bin/llama-server \
   --model /home/nos/models/Qwen3.8-Flash-Next-FTQ-RANKED-H256-IQ2XXS.gguf \
   --host 0.0.0.0 \
@@ -46,6 +65,5 @@ exec /run/media/nos/games/inference_engines/workstreams/llama.cpp-mtp-slot-state
   --cache-type-k q4_0 \
   --cache-type-v q4_0 \
   -ngl 48 \
-  -ot 'blk.*.ffn_(gate|up|down)_exps_hot=CPU' \
-  -ot 'blk.*.ffn_(gate|up|down)_exps_cold=CPU' \
+  -ot 'blk.*.ffn_(gate|up|down)_exps_hot=CPU,blk.*.ffn_(gate|up|down)_exps_cold=CPU' \
   --ngram-ssd
