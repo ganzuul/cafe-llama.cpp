@@ -5327,6 +5327,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->type == op->src[0]->type &&
                    op->src[2]->ne[0] == op->src[1]->ne[0] &&
                    op->src[2]->ne[1] == op->src[1]->ne[1];
+        case GGML_OP_MOE_REMAP_IDS:
+            // Runs on CPU alongside STAGE_EXPERTS; small integer pass.
+            return op->src[0]->type == GGML_TYPE_I32 &&
+                   op->src[1]->type == GGML_TYPE_I32 &&
+                   op->type         == GGML_TYPE_I32;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:

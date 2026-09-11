@@ -33,6 +33,7 @@ void ggml_compute_forward_add_id(const struct ggml_compute_params * params, stru
 void ggml_compute_forward_moe_branch_ids(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_moe_expert_gather(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_stage_experts(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_moe_remap_ids(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_acc(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_sum(const struct ggml_compute_params * params, struct ggml_tensor * dst);

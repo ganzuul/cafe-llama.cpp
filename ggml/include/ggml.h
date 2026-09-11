@@ -614,6 +614,21 @@ extern "C" {
         // tokens are staged (batch dim), not the full descriptor.
         GGML_OP_STAGE_EXPERTS,
 
+        // Remap original expert ids to compact staged-expert slots.
+        //
+        //   src0 = ids [n_expert_used, n_tokens]   (i32, original expert ids)
+        //   src1 = ids_sorted                      (i32, sorted union from STAGE_EXPERTS)
+        //   dst  = [n_expert_used, n_tokens]       (i32, slots into the staged tensor)
+        //
+        // ids_sorted is the same tensor passed to ggml_stage_experts(); its
+        // union is written linearly across all of its elements, and this op
+        // searches all of them. Ids absent from the union or at/above mask_from
+        // map to -1. op_params[0] holds mask_from.
+        //
+        // Ordering: ids_sorted is filled by STAGE_EXPERTS as a side effect, so
+        // callers must establish a graph edge ensuring STAGE_EXPERTS runs first.
+        GGML_OP_MOE_REMAP_IDS,
+
         GGML_OP_COUNT,
     };
 
@@ -1531,6 +1546,17 @@ extern "C" {
     // Number of valid expert planes in a ggml_stage_experts() result.
     // Valid only after the graph containing the op has executed.
     GGML_API int32_t ggml_stage_experts_n_union(const struct ggml_tensor * t);
+
+    // Remap original expert ids to compact slots in a staged expert tensor.
+    // ids_sorted comes from the ids_sorted tensor passed to ggml_stage_experts().
+    // The op must execute in the same graph, after STAGE_EXPERTS has run (the
+    // union is written by that op). Entries not present in the union, or below
+    // mask_from, map to -1.
+    GGML_API struct ggml_tensor * ggml_moe_remap_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * ids_sorted,
+            int32_t               mask_from);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

@@ -1109,10 +1109,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MOE_BRANCH_IDS",
+    "MOE_EXPERT_GATHER",
     "STAGE_EXPERTS",
+    "MOE_REMAP_IDS",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1229,9 +1231,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "moe_branch_ids(x)",
     "moe_expert_gather(as, ids)",
     "stage_experts(as, ids)",
+    "moe_remap_ids(ids, sorted)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3504,6 +3507,25 @@ struct ggml_tensor * ggml_stage_experts(
 int32_t ggml_stage_experts_n_union(const struct ggml_tensor * t) {
     GGML_ASSERT(t->op == GGML_OP_STAGE_EXPERTS);
     return ggml_get_op_params_i32(t, 0);
+}
+
+struct ggml_tensor * ggml_moe_remap_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * ids_sorted,
+        int32_t               mask_from) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids_sorted->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+
+    result->op     = GGML_OP_MOE_REMAP_IDS;
+    result->src[0] = ids;
+    result->src[1] = ids_sorted;
+
+    ggml_set_op_params_i32(result, 0, mask_from);
+
+    return result;
 }
 
 // ggml_out_prod

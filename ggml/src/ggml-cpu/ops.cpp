@@ -12369,3 +12369,66 @@ void ggml_compute_forward_stage_experts(const ggml_compute_params * params, ggml
                 plane_bytes, (long long) (ggml_time_us() - t_start_us));
     }
 }
+
+// ggml_compute_forward_moe_remap_ids
+//
+// Maps each original expert id to its slot in the compact staged tensor, using
+// the sorted union written by STAGE_EXPERTS. Ids that are absent from the union,
+// out of range, or below mask_from become -1.
+//
+//   ids        -> [n_expert_used, n_tokens]  (i32, original ids)
+//   ids_sorted -> [n_out, 1]                 (i32, sorted union, -1 padded)
+//   dst        -> [n_expert_used, n_tokens]  (i32, staged slots)
+void ggml_compute_forward_moe_remap_ids(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * ids        = dst->src[0];
+    const ggml_tensor * ids_sorted = dst->src[1];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids_sorted->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == ids->ne[0] && dst->ne[1] == ids->ne[1]);
+
+    const int32_t mask_from = ggml_get_op_params_i32(dst, 0);
+    // The union is written linearly across every element of ids_sorted, which is
+    // shaped [n_expert_used, n_tokens] (same as ids) -- not [n_out, 1]. Search
+    // the full element count.
+    const int64_t n_out     = ids_sorted->ne[0] * ids_sorted->ne[1];
+    const int64_t n_ids     = ids->ne[0] * ids->ne[1];
+
+    const int32_t * sorted = (const int32_t *) ids_sorted->data;
+    const int32_t * src    = (const int32_t *) ids->data;
+    int32_t *       out    = (int32_t *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t per_thread = (n_ids + nth - 1) / nth;
+    const int64_t i_start = ith * per_thread;
+    const int64_t i_end   = MIN(i_start + per_thread, n_ids);
+
+    for (int64_t i = i_start; i < i_end; ++i) {
+        const int32_t id = *(const int32_t *) ((const char *) src + i * ids->nb[0]);
+
+        // Same masking semantics as MOE_BRANCH_IDS: ids at or above mask_from
+        // are zeroed by the downstream mul_mat_id rather than computed.
+        if (mask_from >= 0 && id >= mask_from) {
+            out[i] = -1;
+            continue;
+        }
+
+        // Binary search over the sorted union. The union is ascending, with -1
+        // padding at the tail, so trim the padding first and search only the
+        // prefix of real entries.
+        int64_t hi = n_out - 1;
+        while (hi >= 0 && sorted[hi] < 0) { hi--; }
+
+        int64_t lo = 0, found = -1;
+        while (lo <= hi) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            const int32_t v = sorted[mid];
+            if (v == id) { found = mid; break; }
+            if (v < id) { lo = mid + 1; } else { hi = mid - 1; }
+        }
+        out[i] = (int32_t) found;
+    }
+}

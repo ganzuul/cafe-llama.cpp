@@ -99,12 +99,27 @@ int main() {
     CHECK(staged->type == GGML_TYPE_Q4_0, "staged tensor must preserve source type, got %d", (int) staged->type);
     CHECK(staged->ne[2] == n_used * n_tokens, "staged expert dim should be max union, got %lld", (long long) staged->ne[2]);
 
+    // The remap op must observe ids_sorted, which STAGE_EXPERTS fills as a side
+    // effect. ggml tracks dependencies through src[], and ids_sorted is a leaf,
+    // so the edge has to be stated explicitly or the remap may be scheduled
+    // (and executed) before the union exists. This mirrors the requirement in
+    // the real graph wiring.
+    struct ggml_tensor * remapped = ggml_moe_remap_ids(ctx, ids, ids_sorted, -1);
+    CHECK(remapped != nullptr, "ggml_moe_remap_ids returned null");
+    CHECK(remapped->ne[0] == ids->ne[0] && remapped->ne[1] == ids->ne[1],
+          "remapped shape must match ids");
+    // Ordering edge: ids_sorted is a leaf filled by STAGE_EXPERTS as a side
+    // effect, and ggml tracks dependencies only through src[]. Without this the
+    // remap can execute before the union exists. src[2] is unused by the op.
+    remapped->src[2] = staged;
+
     // Execute on the CPU backend.
     ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     CHECK(backend != nullptr, "failed to init CPU backend");
 
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, staged);
+    ggml_build_forward_expand(gf, remapped);
 
     ggml_backend_buffer_t in_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     CHECK(in_buf != nullptr, "failed to allocate tensors");
@@ -116,6 +131,7 @@ int main() {
         ggml_quantize_chunk(GGML_TYPE_Q4_0, w_f32.data(), qbytes.data(), 0, n_embd * n_ff, n_expert, nullptr);
         std::memcpy(w->data, qbytes.data(), qbytes.size());
     }
+
 
     ggml_backend_graph_compute(backend, gf);
 
@@ -181,6 +197,27 @@ int main() {
             }
         }
         std::printf("id remap recovers the correct expert for every routed slot\n");
+    }
+
+    // (5) GGML_OP_MOE_REMAP_IDS produces the same slots as the reference union
+    {
+        const int32_t * r = (const int32_t *) remapped->data;
+        for (size_t t = 0; t < (size_t) n_tokens; ++t) {
+            for (size_t e = 0; e < (size_t) n_used; ++e) {
+                const int32_t orig = ids_host[t * n_used + e];
+                const int64_t idx = t * n_used + e;
+                int32_t expect_slot = -1;
+                if (orig >= 0 && orig < (int32_t) n_expert) {
+                    for (int64_t k = 0; k < n_union; ++k) {
+                        if (expect[k] == orig) { expect_slot = (int32_t) k; break; }
+                    }
+                }
+                CHECK(r[idx] == expect_slot,
+                      "remap[%zu] = %d, expected %d (orig %d)",
+                      (size_t) idx, r[idx], expect_slot, orig);
+            }
+        }
+        std::printf("GGML_OP_MOE_REMAP_IDS slots match the reference union\n");
     }
 
     // Dedup effectiveness, for the record.
