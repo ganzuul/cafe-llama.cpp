@@ -96,6 +96,34 @@ llama-server \
   
 ```
 
+### Stable single-GPU ranked hot/cold recipe
+
+For the ranked `Qwen3.8-Flash-Next-FTQ-RANKED-H256-IQ2XXS.gguf` artifact on an RTX 2070 SUPER with 8 GiB VRAM and approximately 23 GiB system RAM, use:
+
+```sh
+build/bin/run_Flash-Next.sh
+```
+
+The script uses the following placement configuration:
+
+```text
+-np 1
+-ngl 48
+-ot 'blk.*.ffn_(gate|up|down)_exps_hot=CPU'
+-ot 'blk.*.ffn_(gate|up|down)_exps_cold=CPU'
+--ngram-ssd
+```
+
+This keeps the attention, normalization, recurrent-state, and other non-expert work on the GPU while leaving both ranked expert tiers CPU/mmap-backed. `--ngram-ssd` keeps the PLE table on demand when the model contains one. The CPU quantized `mul_mat_id` path is intentional; do not enable the experimental `LLAMA_MOE_EXPERT_GATHER=1` path for this IQ2 artifact.
+
+The reported sustained decode rate for this configuration is approximately **4–6 tok/s**, compared with approximately **1.2 tok/s** for the original downloaded artifact. This is a hardware/configuration measurement and may vary with prompt, context, storage, and cache state.
+
+Do not substitute the following configurations on this machine:
+
+- `-ngl 99`: attempts to place effectively the entire model on an 8 GiB GPU and can exhaust VRAM.
+- `--host-moe` / `-hmoe`: pins all expert weights in host RAM and disables automatic memory fitting; the approximately 61 GiB model cannot fit in approximately 23 GiB RAM.
+- `--pipeline-parallel`: intended for multi-device streaming; on the single-GPU system it attempted a roughly 162 GiB compute allocation before falling back.
+
 ## Building from Source
 
 ### 1. NVIDIA CUDA (Windows / Linux)
