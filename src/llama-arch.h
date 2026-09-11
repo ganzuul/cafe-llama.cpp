@@ -126,6 +126,14 @@ enum llm_arch {
     LLM_ARCH_HUNYUAN_DENSE,
     LLM_ARCH_HUNYUAN_VL,
     LLM_ARCH_HY_V3,
+    // Restored from upstream 49c0dc82b ("model : add Tencent Hy 4 (hy_v4)").
+    // The fork merge kept this arch's consumers (llama-graph.cpp,
+    // llama-context.cpp, tests/test-llama-archs.cpp, llama-model-saver.cpp)
+    // but dropped the declaration, so the tree could not build from scratch.
+    // The model implementation itself remains disabled
+    // (src/models/hy-v4.cpp.disabled) and is NOT supported until its source is
+    // ported to the current hparams/API generation.
+    LLM_ARCH_HY_V4,
     LLM_ARCH_SMOLLM3,
     LLM_ARCH_OPENAI_MOE,
     LLM_ARCH_LFM2,
@@ -300,6 +308,9 @@ enum llm_kv {
     LLM_KV_HYPER_CONNECTION_COUNT,
     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
     LLM_KV_HYPER_CONNECTION_EPSILON,
+    // Restored from upstream 49c0dc82b; consumed by llama-model-saver.cpp and
+    // src/models/hy-v4.cpp.disabled. See the note on LLM_ARCH_HY_V4 above.
+    LLM_KV_HYPER_CONNECTION_MAGNITUDE,
     LLM_KV_HYPER_CONNECTION_LOW_RANK,
 
     LLM_KV_PLE_LAYERS,
@@ -400,6 +411,14 @@ enum llm_kv {
 
     LLM_KV_TARGET_LAYERS,
     LLM_KV_TARGET_HIDDEN_SIZE,
+    // Restored from upstream b10f9ca58 ("spec : add DFlash2 support"). As with
+    // HY_V4, the fork merge kept the consumers (src/models/dflash.cpp) but
+    // dropped these declarations, breaking a from-scratch build.
+    LLM_KV_DFLASH_BLOCK_SIZE,
+    LLM_KV_DFLASH_CONV_KERNEL_SIZE,
+    LLM_KV_DFLASH_CONV_GROUP_SIZE,
+    LLM_KV_DFLASH_SELECTOR_RANK,
+    LLM_KV_DFLASH_SELECTOR_TOP_K,
     LLM_KV_NORM_BEFORE_RESIDUAL,
     LLM_KV_NORM_BEFORE_FC,
 
@@ -704,6 +723,14 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_MARKOV_W1,
     LLM_TENSOR_DSPARK_MARKOV_W2,
     LLM_TENSOR_DSPARK_CONF_PROJ,
+    // Restored from upstream b10f9ca58; see the LLM_KV_DFLASH_* note above.
+    LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
+    LLM_TENSOR_DFLASH_ATTN_CONV_PROJ,
+    LLM_TENSOR_DFLASH_FFN_CONV_BASE,
+    LLM_TENSOR_DFLASH_FFN_CONV_PROJ,
+    LLM_TENSOR_DFLASH_SELECTOR_PREV,
+    LLM_TENSOR_DFLASH_SELECTOR_NEXT,
+    LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
 };
 
 

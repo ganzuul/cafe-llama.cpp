@@ -1469,7 +1469,13 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used()),
+    // Scalar n_expert_used: this fork predates the upstream per-layer refactor
+    // (c61b98b87, which renamed the field to n_expert_used_impl and added
+    // n_expert_used(il) accessors plus an array). llama-hparams.h here exposes
+    // only the scalar field, and 13 other files use that form. During warmup we
+    // size the graph for the worst case (every expert routed) so that later,
+    // narrower graphs fit in the buffers reserved here.
+    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),
@@ -1549,9 +1555,23 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
               int32_t   mask_from) const {
     // [MVP] When mask_from >= 0, this is a MoE expert branch.
-    // Use CPU-side expert gather + standard matmul instead of
-    // ggml_mul_mat_id (which has sync-heavy CUDA dispatch).
-    if (mask_from >= 0) {
+    //
+    // The CPU-side expert gather branch below is SHAPE-BROKEN: it reshapes the
+    // gathered weights to [ne0, ne1, n_exp*n_tok, 1] and repeats the
+    // activations to [ne0, n_exp, n_tok, 1], but ggml_can_mul_mat requires
+    // a->ne[1] == b->ne[1], i.e. ne1 (the expert FFN dim, 640 for this model)
+    // against n_exp (the expert count, 10). It aborts in fit_params probing.
+    // It is also F32-only, so it is wrong for this artifact's IQ2/IQ3/IQ4
+    // experts.
+    //
+    // Gate it off so mask_from >= 0 falls through to the known-good
+    // ggml_mul_mat_id + set_mask_from path. Re-enable only after the shape
+    // math is fixed and quantized experts are supported.
+    static const bool use_moe_expert_gather =
+        getenv("LLAMA_MOE_EXPERT_GATHER") != nullptr &&
+        atoi(getenv("LLAMA_MOE_EXPERT_GATHER")) != 0;
+
+    if (mask_from >= 0 && use_moe_expert_gather && w->type == GGML_TYPE_F32) {
         // CPU-side expert gather: gather expert weights using ids
         // Output shape: [ne0*ne1, n_expert_used, n_tokens, 1]
         ggml_tensor * gathered = ggml_moe_expert_gather(ctx0, w, ids);
@@ -2347,10 +2367,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     assert(n_expert_used > 0);
 
     // order the views before the adds
-    // Use per-layer n_expert_used to bound the graph even during warmup (avoids
-    // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
-    // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+    // Bound the per-expert view loop by the scalar n_expert_used. An earlier
+    // revision read hparams.n_expert_used(il), a per-layer accessor that only
+    // exists after upstream c61b98b87; this fork has the scalar field only.
+    // ref: https://github.com/ggml-org/llama.cpp/pull/14753
+    const uint32_t n_expert_used_il = hparams.n_expert_used;
     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
