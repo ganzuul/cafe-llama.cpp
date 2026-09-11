@@ -2123,7 +2123,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 trace_cold_misses++;
                 trace_h2d_bytes += src0_slice_bytes;
                 trace_d2h_bytes += src0_slice_bytes;
-                trace_h2d_bytes += src0_slice_bytes;
                 src0_dev_buf.alloc(src0_slice_bytes);
                 CUDA_CHECK(cudaMemcpyAsync(src0_dev_buf.ptr, src0_slice.data, src0_slice_bytes, cudaMemcpyHostToDevice, stream));
                 src0_slice.data = src0_dev_buf.ptr;
