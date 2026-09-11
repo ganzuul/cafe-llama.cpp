@@ -1920,10 +1920,46 @@ static void ggml_cuda_moe_gather_complete_cb(void * user_data) {
     }
 }
 
+static void ggml_cuda_moe_trace(const ggml_tensor * dst, int64_t wall_us,
+        size_t h2d_bytes, size_t d2h_bytes, int64_t hot_hits, int64_t cold_misses) {
+    static const char * path = std::getenv("LLAMA_MOE_TRACE");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    static std::mutex mutex;
+    static FILE * file = nullptr;
+    static std::string opened_path;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (file == nullptr || opened_path != path) {
+        if (file != nullptr) {
+            std::fclose(file);
+        }
+        file = std::fopen(path, "a");
+        opened_path = path;
+    }
+    if (file == nullptr) {
+        return;
+    }
+
+    std::fprintf(file,
+        "{\"op\":\"mul_mat_id\",\"ne0\":%lld,\"ne1\":%lld,\"ne2\":%lld,"
+        "\"wall_us\":%lld,\"h2d_bytes\":%zu,\"d2h_bytes\":%zu,"
+        "\"hot_hits\":%lld,\"cold_misses\":%lld}\n",
+        (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+        (long long) wall_us, h2d_bytes, d2h_bytes,
+        (long long) hot_hits, (long long) cold_misses);
+    std::fflush(file);
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // [MVP] Performance hook: measure CUDA mul_mat_id time
     static std::atomic<int64_t> total_cuda_mm_us{0};
     int64_t cuda_start_us = ggml_time_us();
+    size_t trace_h2d_bytes = 0;
+    size_t trace_d2h_bytes = 0;
+    int64_t trace_hot_hits = 0;
+    int64_t trace_cold_misses = 0;
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1995,6 +2031,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
     std::vector<char> ids_host(ggml_nbytes(ids));
+    trace_d2h_bytes += ggml_nbytes(ids);
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -2016,6 +2053,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
+    trace_h2d_bytes += 2*ne_get_rows*sizeof(int32_t);
     CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -2078,9 +2116,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             auto * staging_entry = ctx.staging_mgr.get_staging(i02, src0_slice_bytes, stream, out_is_hot);
             if (staging_entry && staging_entry->dev_ptr) {
                 // Hot expert: use cached staging device pointer
+                trace_hot_hits++;
                 src0_slice.data = (char *) staging_entry->dev_ptr;
             } else {
                 // Cold expert: read from CPU host and copy to staging buffer
+                trace_cold_misses++;
+                trace_h2d_bytes += src0_slice_bytes;
+                trace_d2h_bytes += src0_slice_bytes;
+                trace_h2d_bytes += src0_slice_bytes;
                 src0_dev_buf.alloc(src0_slice_bytes);
                 CUDA_CHECK(cudaMemcpyAsync(src0_dev_buf.ptr, src0_slice.data, src0_slice_bytes, cudaMemcpyHostToDevice, stream));
                 src0_slice.data = src0_dev_buf.ptr;
@@ -2139,7 +2182,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     int64_t cuda_end_us = ggml_time_us();
     int64_t cuda_us = cuda_end_us - cuda_start_us;
     total_cuda_mm_us += cuda_us;
-    GGML_LOG_DEBUG("mul_mat_id: ne0=%lld ne1=%lld ne2=%lld cuda_us=%lld total_cuda_us=%lld",
+    ggml_cuda_moe_trace(dst, cuda_us, trace_h2d_bytes, trace_d2h_bytes, trace_hot_hits, trace_cold_misses);
+    GGML_LOG_DEBUG("mul_mat_id: ne0=%lld ne1=%lld ne2=%lld cuda_us=%lld total_cuda_us=%lld", 
             (long long)ne0, (long long)ne1, (long long)ne2, (long long)cuda_us, total_cuda_mm_us.load());
 }
 
@@ -4417,7 +4461,8 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
-static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(params);
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef USE_CUDA_GRAPH
