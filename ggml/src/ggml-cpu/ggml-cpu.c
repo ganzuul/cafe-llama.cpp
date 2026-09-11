@@ -1550,13 +1550,16 @@ static void ggml_compute_forward_mul_mat_id(
     // worker threads; only thread 0 writes the JSONL record.
     static _Atomic int64_t trace_start_us = 0;
     static FILE * trace_file = NULL;
+    static pthread_mutex_t trace_mutex = PTHREAD_MUTEX_INITIALIZER;
     const char * trace_path = getenv("LLAMA_MOE_TRACE");
     const bool trace = trace_path != NULL && trace_path[0] != '\0';
     if (trace && params->ith == 0) {
+        pthread_mutex_lock(&trace_mutex);
         if (trace_file == NULL) {
             trace_file = fopen(trace_path, "ab");
         }
         atomic_store_explicit(&trace_start_us, ggml_time_us(), memory_order_relaxed);
+        pthread_mutex_unlock(&trace_mutex);
     }
 
     const struct ggml_tensor * src0 = dst->src[0];
@@ -1774,6 +1777,7 @@ static void ggml_compute_forward_mul_mat_id(
             const int64_t start_us = atomic_load_explicit(&trace_start_us, memory_order_relaxed);
             const int64_t wall_us = ggml_time_us() - start_us;
             if (trace_file != NULL) {
+                pthread_mutex_lock(&trace_mutex);
                 fprintf(trace_file,
                     "{\"backend\":\"cpu\",\"op\":\"mul_mat_id\",\"ne0\":%" PRId64
                     ",\"ne1\":%" PRId64 ",\"ne2\":%" PRId64
@@ -1783,6 +1787,7 @@ static void ggml_compute_forward_mul_mat_id(
                     ne0, ne1, ne2, n_ids, n_as, trace_routes, trace_masked,
                     trace_unique, wall_us);
                 fflush(trace_file);
+                pthread_mutex_unlock(&trace_mutex);
             }
             free(trace_seen);
         }
