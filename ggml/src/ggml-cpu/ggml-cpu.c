@@ -33,6 +33,10 @@
 #include <stdio.h>
 #include <float.h>
 #include <limits.h>
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/resource.h>
+#include <sys/mman.h>
+#endif
 #include <stdarg.h>
 #include <signal.h>
 #if defined(__gnu_linux__)
@@ -1462,6 +1466,72 @@ UseGgmlGemm2:;
     }
 }
 
+// Read process-wide page-fault counters from /proc/self/stat.
+//
+// Fields (1-indexed): 10 = min_flt, 12 = maj_flt. Both count every fault
+// taken by the process, not just the calling thread, which is what we need
+// to attribute faults to a dispatch executed by a worker pool.
+//
+// Returns false (leaving outputs untouched) when /proc is unavailable, so
+// non-Linux builds simply report 0 rather than failing.
+static bool ggml_cpu_moe_trace_proc_faults(long * out_minflt, long * out_majflt) {
+#if defined(__linux__)
+    static _Atomic int warned = 0;
+    FILE * f = fopen("/proc/self/stat", "r");
+    if (f == NULL) {
+        return false;
+    }
+
+    // comm may contain spaces and parentheses, so parse from the last ')'.
+    char buf[4096];
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    char * rparen = strrchr(buf, ')');
+    if (rparen == NULL || *(rparen + 1) == '\0') {
+        return false;
+    }
+
+    // First token after ")" is state (field 3); min_flt is field 10, so we
+    // need to advance 8 numeric tokens past state.
+    const char * p = rparen + 1;
+    long field = 3;
+    long vals[2] = { 0, 0 };
+    int got = 0;
+    char * end = NULL;
+    while (field <= 12 && *p != '\0') {
+        while (*p == ' ') ++p;
+        if (*p == '\0') break;
+        const long v = strtol(p, &end, 10);
+        if (end == p) {
+            // non-numeric token: skip it (state field is alphabetic)
+            while (*p != ' ' && *p != '\0') ++p;
+        } else {
+            p = end;
+            if (field == 10) { vals[0] = v; got |= 1; }
+            if (field == 12) { vals[1] = v; got |= 2; }
+        }
+        ++field;
+    }
+
+    if (got != 3) {
+        if (!atomic_exchange_explicit(&warned, 1, memory_order_relaxed)) {
+            GGML_LOG_WARN("%s: could not parse min_flt/maj_flt from /proc/self/stat\n", __func__);
+        }
+        return false;
+    }
+
+    *out_minflt = vals[0];
+    *out_majflt = vals[1];
+    return true;
+#else
+    (void) out_minflt;
+    (void) out_majflt;
+    return false;
+#endif
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1553,11 +1623,24 @@ static void ggml_compute_forward_mul_mat_id(
     static pthread_mutex_t trace_mutex = PTHREAD_MUTEX_INITIALIZER;
     const char * trace_path = getenv("LLAMA_MOE_TRACE");
     const bool trace = trace_path != NULL && trace_path[0] != '\0';
+    // Process-wide fault counters.
+    //
+    // Earlier revisions sampled getrusage(RUSAGE_THREAD) on thread 0 of a
+    // 12-thread pool, which captured only ~5.7%% of process-wide major faults
+    // (8,130 traced vs 142,940 in /proc/vmstat for the same generation). That
+    // made per-dispatch fault attribution unusable. /proc/self/stat records
+    // min_flt (field 10) and maj_flt (field 12) process-wide, so a delta
+    // across the dispatch reflects every worker thread. See
+    // ftq-recipe/docs/2026-09-11-expert-fetch-intervention-plan.md
+    // (Intervention A).
+    long trace_minflt_start = 0;
+    long trace_majflt_start = 0;
     if (trace && params->ith == 0) {
         pthread_mutex_lock(&trace_mutex);
         if (trace_file == NULL) {
             trace_file = fopen(trace_path, "ab");
         }
+        ggml_cpu_moe_trace_proc_faults(&trace_minflt_start, &trace_majflt_start);
         atomic_store_explicit(&trace_start_us, ggml_time_us(), memory_order_relaxed);
         pthread_mutex_unlock(&trace_mutex);
     }
@@ -1776,6 +1859,10 @@ static void ggml_compute_forward_mul_mat_id(
         if (params->ith == 0) {
             const int64_t start_us = atomic_load_explicit(&trace_start_us, memory_order_relaxed);
             const int64_t wall_us = ggml_time_us() - start_us;
+            long end_minflt = 0, end_majflt = 0;
+            ggml_cpu_moe_trace_proc_faults(&end_minflt, &end_majflt);
+            const long d_minflt = end_minflt - trace_minflt_start;
+            const long d_majflt = end_majflt - trace_majflt_start;
             if (trace_file != NULL) {
                 pthread_mutex_lock(&trace_mutex);
                 fprintf(trace_file,
@@ -1783,9 +1870,12 @@ static void ggml_compute_forward_mul_mat_id(
                     ",\"ne1\":%" PRId64 ",\"ne2\":%" PRId64
                     ",\"n_ids\":%d,\"n_expert\":%d,\"routes\":%" PRId64
                     ",\"masked\":%" PRId64 ",\"unique_experts\":%" PRId64
-                    ",\"wall_us\":%" PRId64 "}\n",
+                    ",\"expert_bytes\":%zu"
+                    ",\"minflt\":%ld,\"majflt\":%ld"
+                    ",\"n_threads\":%d,\"wall_us\":%" PRId64 "}\n",
                     ne0, ne1, ne2, n_ids, n_as, trace_routes, trace_masked,
-                    trace_unique, wall_us);
+                    trace_unique, (size_t) n_as * ggml_nbytes(src0) / (size_t) (n_as ? n_as : 1),
+                    d_minflt, d_majflt, nth, wall_us);
                 fflush(trace_file);
                 pthread_mutex_unlock(&trace_mutex);
             }
